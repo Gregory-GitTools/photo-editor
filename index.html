@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Обрезка фото 9:16</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="setup-screen">
+  <h1>Обрезка фото в 9:16</h1>
+  <p>Выберите папку с фото и подпапку для сохранения результата.</p>
+  <div class="setup-row">
+    <button id="pick-source-btn">1. Выбрать папку с фото</button>
+    <span id="source-label" class="path-label"></span>
+  </div>
+  <div class="setup-row">
+    <button id="pick-output-btn" disabled>2. Выбрать/создать папку результата</button>
+    <span id="output-label" class="path-label"></span>
+  </div>
+  <div class="setup-row">
+    <button id="start-btn" disabled>3. Начать</button>
+  </div>
+  <p id="setup-status" class="status"></p>
+</header>
+
+<main id="editor-screen" hidden>
+  <div class="toolbar">
+    <span id="progress-label"></span>
+    <label class="rotate-control">
+      Выровнять горизонт
+      <input type="range" id="rotate-slider" min="-15" max="15" step="0.1" value="0">
+      <span id="rotate-value">0°</span>
+    </label>
+    <button id="reset-btn">Сбросить рамку</button>
+    <button id="back-btn">← Назад</button>
+    <button id="skip-btn">Пропустить →</button>
+    <button id="save-btn" class="primary">Сохранить и дальше →</button>
+  </div>
+  <div id="canvas-wrap">
+    <canvas id="photo-canvas"></canvas>
+  </div>
+  <p id="editor-status" class="status"></p>
+</main>
+
+<script src="https://docs.opencv.org/4.9.0/opencv.js" async></script>
+<script src="imaging.js"></script>
+<script src="vision.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
