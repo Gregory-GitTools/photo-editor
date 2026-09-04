@@ -4,7 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Обрезка фото 9:16</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
+<link rel="icon" href="icons/icon-32.png" sizes="32x32">
+<link rel="icon" href="icons/icon-192.png" sizes="192x192">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="theme-color" content="#1b1b1f">
 </head>
 <body>
 <header id="setup-screen">
@@ -22,6 +29,10 @@
     <button id="start-btn" disabled>3. Начать</button>
   </div>
   <p id="setup-status" class="status"></p>
+  <div class="about-row">
+    <p class="about-text">Личный некоммерческий проект — готовит фотографии для <a href="https://gregory-gittools.github.io/travel-globe/" target="_blank" rel="noopener">Travel Globe</a>. Работает полностью локально: фото не покидают компьютер, нет рекламы и сбора данных.</p>
+    <p class="about-credits">Сделано на основе открытых инструментов: <a href="https://docs.opencv.org/4.9.0/d5/d10/tutorial_js_root.html" target="_blank" rel="noopener">OpenCV.js</a> (поиск линий горизонта), File System Access API, шрифт — Google Fonts (Poppins).</p>
+  </div>
 </header>
 
 <main id="editor-screen" hidden>
