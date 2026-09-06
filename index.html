@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Обрезка фото 9:16</title>
+<title>Альбом</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -14,49 +14,92 @@
 <meta name="theme-color" content="#1b1b1f">
 </head>
 <body>
-<header id="setup-screen">
-  <h1>Обрезка фото в 9:16</h1>
-  <p>Выберите папку с фото и подпапку для сохранения результата.</p>
-  <div class="setup-row">
-    <button id="pick-source-btn">1. Выбрать папку с фото</button>
-    <span id="source-label" class="path-label"></span>
-  </div>
-  <div class="setup-row">
-    <button id="pick-output-btn" disabled>2. Выбрать/создать папку результата</button>
-    <span id="output-label" class="path-label"></span>
-  </div>
-  <div class="setup-row">
-    <button id="start-btn" disabled>3. Начать</button>
-  </div>
-  <p id="setup-status" class="status"></p>
-  <div class="about-row">
+
+<div id="app-body">
+  <aside id="left-column">
+    <div class="folder-toolbar">
+      <button id="up-dir-btn" title="Перейти на уровень выше" disabled><img src="icons/Folder UP WIT.png" alt=""></button>
+      <button id="open-album-btn" title="Открыть альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
+      <button id="continue-album-btn" hidden title="Продолжить последний альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
+      <button id="refresh-album-btn" hidden title="Обновить альбом"><img src="icons/Restore WIT.png" alt=""></button>
+      <button id="settings-btn" title="О программе"><img src="icons/Gear WIT.png" alt=""></button>
+    </div>
+    <div id="folder-tree"></div>
+    <div id="resizer-properties" class="resizer resizer-horizontal" title="Потяните, чтобы изменить высоту панели параметров"></div>
+    <div id="properties-panel">
+      <h3>Параметры</h3>
+      <dl id="properties-list"></dl>
+      <div id="properties-map" hidden>
+        <iframe id="properties-map-frame" title="Место съёмки" loading="lazy"></iframe>
+      </div>
+    </div>
+  </aside>
+  <div id="resizer-vertical" class="resizer resizer-vertical" title="Потяните, чтобы изменить ширину"></div>
+
+  <main id="editor-pane">
+    <div id="canvas-wrap">
+      <canvas id="photo-canvas"></canvas>
+    </div>
+
+    <div id="resizer-horizontal" class="resizer resizer-horizontal" title="Потяните, чтобы изменить высоту ленты"></div>
+
+    <aside id="album-grid"></aside>
+
+    <div class="toolbar">
+      <label class="aspect-control" title="Формат кадра">
+        <select id="aspect-select" disabled>
+          <option value="9x16">9:16</option>
+          <option value="4x5">4:5</option>
+          <option value="1x1">1:1</option>
+          <option value="4x3">4:3</option>
+          <option value="16x9">16:9</option>
+        </select>
+      </label>
+      <label class="rotate-control" title="Выровнять горизонт">
+        ⚖
+        <input type="range" id="rotate-slider" min="-15" max="15" step="0.1" value="0" disabled>
+        <span id="rotate-value" title="Сбросить угол (0°)">0°</span>
+      </label>
+      <button id="rotate-toggle-btn" title="Показать/скрыть ползунок поворота" disabled><img src="icons/Вращение WIT.png" alt=""></button>
+      <button id="reset-btn" title="Сбросить рамку" disabled><img src="icons/Кадрирование WIT.png" alt=""></button>
+      <button id="perspective-btn" title="Коррекция перспективы" disabled><img src="icons/Коррекция перспективы WIT.png" alt=""></button>
+      <button id="grid-btn" title="Сетка" disabled><img src="icons/Lattice WIT.png" alt=""></button>
+      <button id="color-btn" title="Цветокоррекция" disabled><img src="icons/Palette WIT.png" alt=""></button>
+      <button id="restore-btn" title="Восстановить оригинал" disabled><img src="icons/Back WIT.png" alt=""></button>
+      <button id="star-btn" title="Добавить в альбом" disabled><img src="icons/Star WIT.png" alt=""></button>
+      <span id="progress-label"></span>
+      <button id="prev-btn" title="Предыдущее" disabled>◀</button>
+      <button id="next-btn" title="Следующее" disabled>▶</button>
+      <button id="save-btn" title="Сохранить" disabled><img src="icons/Save WIIT.png" alt=""></button>
+    </div>
+
+    <p id="status-bar" class="status"></p>
+  </main>
+</div>
+
+<div id="about-modal" class="modal" hidden>
+  <div class="modal-content">
+    <button id="about-close-btn" class="modal-close" title="Закрыть"><img src="icons/X WIT.png" alt=""></button>
+    <h2>О программе Альбом</h2>
+    <hr class="about-divider">
+    <div class="about-brand">
+      <img src="icons/icon-192.png" alt="Albom" class="about-logo">
+      <div>
+        <div class="about-wordmark">Albom</div>
+        <div class="about-tagline">Sole / Soul — travel barefoot, dream wide.</div>
+      </div>
+    </div>
     <p class="about-text">Личный некоммерческий проект — готовит фотографии для <a href="https://gregory-gittools.github.io/travel-globe/" target="_blank" rel="noopener">Travel Globe</a>. Работает полностью локально: фото не покидают компьютер, нет рекламы и сбора данных.</p>
+    <p class="about-text">Эта страница полностью сгенерирована ИИ-помощником Claude.</p>
+    <p class="about-text">Больше — на канале <a href="https://www.youtube.com/@Gregory-Flow" target="_blank" rel="noopener">Gregory Flow</a>.</p>
     <p class="about-credits">Сделано на основе открытых инструментов: <a href="https://docs.opencv.org/4.9.0/d5/d10/tutorial_js_root.html" target="_blank" rel="noopener">OpenCV.js</a> (поиск линий горизонта), File System Access API, шрифт — Google Fonts (Poppins).</p>
   </div>
-</header>
-
-<main id="editor-screen" hidden>
-  <div class="toolbar">
-    <span id="progress-label"></span>
-    <label class="rotate-control">
-      Выровнять горизонт
-      <input type="range" id="rotate-slider" min="-15" max="15" step="0.1" value="0">
-      <span id="rotate-value">0°</span>
-    </label>
-    <button id="reset-btn">Сбросить рамку</button>
-    <button id="back-btn">← Назад</button>
-    <button id="skip-btn">Пропустить →</button>
-    <button id="save-btn" class="primary">Сохранить и дальше →</button>
-  </div>
-  <div id="canvas-wrap">
-    <canvas id="photo-canvas"></canvas>
-  </div>
-  <p id="editor-status" class="status"></p>
-</main>
+</div>
 
 <script src="https://docs.opencv.org/4.9.0/opencv.js" async></script>
 <script src="imaging.js"></script>
 <script src="vision.js"></script>
+<script src="exif.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
