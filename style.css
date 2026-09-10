@@ -41,6 +41,14 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .status { color: var(--muted); min-height: 1.2em; margin: 0; padding: 4px 16px; }
 
+.editor-topbar .status {
+  padding: 0;
+  margin: 0;
+  min-height: 0;
+  line-height: 21px;
+  flex: 1;
+}
+
 #app-body {
   flex: 1;
   display: flex;
@@ -65,7 +73,9 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 
 .toolbar button,
-.folder-toolbar button {
+.folder-toolbar button,
+.properties-map-buttons button,
+.properties-copy-btn {
   width: 21px;
   height: 21px;
   padding: 0;
@@ -80,31 +90,64 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   font-size: 0.96rem;
 }
 
+.properties-copy-btn {
+  position: absolute;
+  right: 0;
+  top: 0;
+  background: transparent;
+  border: none;
+  appearance: none;
+  -webkit-appearance: none;
+  box-shadow: none;
+}
+
+.properties-copy-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+}
+
 .folder-toolbar button img,
 .toolbar button img,
+.properties-map-buttons button img,
+.properties-copy-btn img,
 .modal-close img {
   width: 100%;
   height: 100%;
   object-fit: contain;
 }
 
+.folder-toolbar button svg,
+.toolbar button svg {
+  width: 68%;
+  height: 68%;
+}
+
 #folder-tree {
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 10px;
   background: var(--panel);
+  min-height: 0;
 }
 
 #properties-panel {
-  flex: 1;
+  flex: 0 0 auto;
   overflow-y: auto;
   padding: 10px 12px;
   background: var(--panel);
   min-height: 0;
 }
 
-#properties-panel h3 {
+#properties-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
   margin: 0 0 10px;
+}
+
+#properties-panel h3 {
+  margin: 0;
   font-size: 0.85rem;
   color: var(--muted);
   text-transform: uppercase;
@@ -115,6 +158,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   margin: 0;
   display: grid;
   grid-template-columns: auto 1fr;
+  align-items: center;
   gap: 6px 10px;
 }
 
@@ -125,20 +169,129 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 
 #properties-list dd {
+  position: relative;
   margin: 0;
+  padding-right: 24px; /* место под кнопку-оверлей копирования, чтобы не наезжала на текст */
+  min-height: 21px; /* иначе кнопка-оверлей (21px) обрезается снизу по overflow:hidden строки */
   font-size: 0.85rem;
-  word-break: break-word;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0; /* иначе grid-колонка растягивается под нативный <input type="date"> и вылезает за панель */
 }
 
-#properties-map {
+#properties-list dd.empty {
+  opacity: 0.4;
+}
+
+.properties-edit-input {
+  width: 100%;
+  min-width: 0;
+  font: inherit;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 1px 4px;
+  box-sizing: border-box;
+}
+
+.properties-edit-input:disabled {
+  opacity: 0.85;
+  cursor: default;
+}
+
+.properties-edit-input:not(:disabled) {
+  background: #1b1b1f;
+  border-color: #3a3a42;
+}
+
+.properties-edit-input:not(:disabled):focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.properties-edit-input[type="datetime-local"] {
+  color-scheme: dark;
+}
+
+/* свой значок календаря конфликтует с оверлеем кнопки копирования справа —
+   правка даты и так задумана вводом цифр (см. title поля) */
+.properties-edit-input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  display: none;
+}
+
+@keyframes copy-flash {
+  from { background: var(--accent); }
+  to { background: transparent; }
+}
+
+.properties-copy-btn.copy-flash {
+  animation: copy-flash 350ms ease-out;
+}
+
+.properties-map-buttons {
+  display: flex;
+  gap: 8px;
   margin-top: 10px;
 }
 
-#properties-map-frame {
-  width: 100%;
-  height: 300px;
-  border: 0;
-  border-radius: 6px;
+.properties-map-embed {
+  margin-top: 10px;
+  height: 213px;
+  overflow: hidden;
+  position: relative;
+  background: #2f2f36;
+}
+
+#properties-map-embed-frame {
+  position: absolute;
+  inset: 0;
+}
+
+/* метки альбома на карте (см. geo-markers.js) — та же капля с числом кадров и в отдельном
+   окне map.html, чтобы обе карты выглядели и вели себя одинаково */
+.geo-pin-icon {
+  background: transparent;
+  border: none;
+}
+
+.geo-pin-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+}
+
+.geo-pin {
+  width: 22px;
+  height: 22px;
+  border-radius: 50% 50% 50% 0;
+  background: #4a90d9;
+  border: 2px solid #fff;
+  transform: rotate(-45deg);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+.geo-pin-num {
+  margin-top: 2px;
+  font: 600 11px/1 system-ui, sans-serif;
+  color: #fff;
+  background: rgba(27, 27, 31, 0.75);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+.geo-pin-wrap.active .geo-pin {
+  background: #ffb400;
+  width: 28px;
+  height: 28px;
+}
+
+.geo-pin-wrap.active .geo-pin-num {
+  background: #ffb400;
+  color: #1b1b1f;
+  font-weight: 700;
 }
 
 .resizer-vertical {
@@ -209,7 +362,40 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   min-height: 0;
 }
 
+/* ручное скрытие боковой панели и ленты фото кнопками в верхней панели состояния —
+   независимо от полноэкранного просмотра, просто чтобы освободить место под фото */
+body.hide-left #left-column,
+body.hide-left #resizer-vertical {
+  display: none;
+}
+
+body:not(.panel-right) #resizer-right,
+body.panel-right #resizer-horizontal {
+  display: none;
+}
+
+body.hide-bottom #album-grid,
+body.hide-bottom:not(.panel-right) #resizer-horizontal,
+body.hide-bottom.panel-right #resizer-right {
+  display: none;
+}
+
+/* лента привью живёт в этой обёртке вместе с канвасом — по умолчанию друг под другом
+   (лента снизу), а в режиме боковой панели (см. toggleRightPanel) — бок о бок */
+#canvas-row {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+body.panel-right #canvas-row {
+  flex-direction: row;
+}
+
 #canvas-wrap {
+  position: relative;
   flex: 1;
   display: flex;
   align-items: center;
@@ -219,13 +405,41 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   min-height: 0;
 }
 
-#photo-canvas {
-  max-width: 100%;
-  max-height: 100%;
-  touch-action: none;
-  cursor: grab;
+#canvas-wrap:fullscreen {
+  background: #000;
 }
 
+#photo-canvas {
+  /* без max-width/max-height:100% — при сжатии окна/панелей фото не должно ужиматься само
+     собой, оно просто уходит за край canvas-wrap (у него overflow: hidden), не мешая тащить
+     границу; актуальный размер под окно выставляется явно через fitPreviewToWindow в app.js */
+  touch-action: none;
+  cursor: grab;
+  /* width/height теперь всегда конкретные px (см. setPreviewZoom в app.js), а не auto — поэтому
+     смена фото/масштаба между разными по размеру и ориентации кадрами плавно анимируется этим
+     переходом, а не скачет мгновенно; это же покрывает вход/выход из fullscreen — там размер
+     тоже считает fitPreviewToWindow, а не отдельное CSS-правило */
+  transition: width 0.2s ease, height 0.2s ease;
+}
+
+/* снимок предыдущего кадра слайдшоу, наложенный поверх основного канваса — плавно растворяется
+   (не гаснет в чёрное), открывая уже отрисованное под ним следующее фото; см. startSlideshow */
+#slideshow-fade-canvas {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.7s ease;
+}
+
+/* В нижнем режиме — обычная одна строка (flex-direction: row), миниатюры растут по высоте
+   ленты и просто уезжают за край, листаются горизонтальной прокруткой (колесо/стрелки —
+   см. app.js), как и было изначально.
+   В боковом режиме (panel-right) — обычная сетка (flex-direction: row + wrap): миниатюры
+   заполняют строку слева направо, а когда ширина заканчивается, переносятся на строку ниже
+   ("пачкуются") — лишние миниатюры листаются вертикальной прокруткой. */
 #album-grid {
   height: 110px;
   flex-shrink: 0;
@@ -238,24 +452,88 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   gap: 8px;
 }
 
+/* боковой режим: ровно rightPanelCols столбиков-обёрток (.thumb-col), которые собирает и
+   перекладывает layoutRightColumns() в app.js при каждом пересчёте размеров — они лежат в ряд
+   (сама лента — flex-direction: row), а внутри каждой обёртки миниатюры идут друг под другом
+   (flex-direction: column) в порядке "сверху вниз", как и раньше. Число столбцов тут фиксировано
+   явно (а не через flex-wrap/CSS grid) специально ради того, чтобы миниатюры могли сохранять
+   собственные пропорции кадра (см. .thumb ниже) — при "естественном" переносе по высоте
+   (flex-wrap) миниатюра высотой больше плейсхолдерной легко создала бы лишний, не влезающий по
+   ширине столбец, а он просто обрезался бы overflow-x: hidden вместе с фото в нём */
+body.panel-right #album-grid {
+  height: auto;
+  width: 240px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.thumb-col {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 8px;
+  width: var(--thumb-size, 152px);
+}
+
 .thumb {
   position: relative;
   border: 2px solid transparent;
   border-radius: 6px;
   overflow: hidden;
   background: #0e0e10;
-  height: 100%;
   aspect-ratio: 3 / 4;
   flex-shrink: 0;
   cursor: pointer;
   padding: 0;
 }
 
-.thumb img {
+/* размер миниатюр — единая переменная, которую пересчитывает updateThumbSizing() при
+   перетаскивании границы ленты (--thumb-size задаёт высоту в нижнем режиме, ширину — в
+   боковом; вторая сторона следует из aspect-ratio) — одна и та же формула в обоих режимах */
+body:not(.panel-right) .thumb {
+  height: var(--thumb-size, 90px);
+}
+
+/* в боковом режиме миниатюра показывает настоящие пропорции кадра (портрет/альбом — вперемешку,
+   как и сняты фото), а не обрезается под общий формат — так удобнее ориентироваться по ленте.
+   Пока фото не подгрузилось (нет .loaded на img), высоту держим плейсхолдером 3:4 (тот же, что
+   и в base .thumb), чтобы кнопка не схлопывалась в нулевую высоту и лента не прыгала; как
+   только реальная картинка подгрузилась — aspect-ratio снимается, и высота идёт от неё самой
+   (через img { height: 100% }, которое в этот момент трактуется как auto — у auto-высокого
+   родителя проценты по высоте не имеют опоры) */
+body.panel-right .thumb {
+  width: var(--thumb-size, 152px);
+  height: auto;
+}
+
+body.panel-right .thumb:has(> img.loaded) {
+  aspect-ratio: auto;
+}
+
+/* пока идёт подбор цветокоррекции, лента временно показывает всего 4 крупные кнопки-варианта
+   вместо миниатюр альбома — в боковом режиме их прижимаем к низу ленты (а не к верху, как
+   обычные миниатюры), чтобы не путать с листанием фото */
+body.panel-right #album-grid.color-picker-mode {
+  align-items: flex-end;
+}
+
+/* ">" — а не просто ".thumb img" — иначе то же правило цепляет и значки-бейджи (звезда,
+   "отредактировано"), которые вложены глубже и никогда не получают класс "loaded" */
+.thumb > img {
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
+  opacity: 0; /* пока не подгрузилась — просто тёмный фон, а не битая иконка с именем файла */
+  transition: opacity 0.15s ease;
+}
+
+.thumb > img.loaded {
+  opacity: 1;
 }
 
 .thumb.active { border-color: var(--accent); }
@@ -326,9 +604,18 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   line-height: 1;
 }
 
+.toolbar button.active,
+.folder-toolbar button.active,
+.properties-map-buttons button.active {
+  background: var(--accent);
+  color: #1b1b1f;
+  border-color: var(--accent);
+}
+
 #progress-label {
   color: var(--muted);
-  font-size: 1.02rem;
+  font-size: 0.8rem;
+  white-space: nowrap;
 }
 
 .rotate-control {
@@ -339,8 +626,28 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   font-size: 1.08rem;
 }
 
+.rotate-control #rotate-slider {
+  width: 320px; /* на треть длиннее прежних 240px — диапазон вырос до ±90°, нужен больший ход для той же точности */
+}
+
+/* активность ползунка и так видна по подсвеченной кнопке rotate-toggle-btn рядом —
+   отдельная рамка фокуса на самом ползунке (в т.ч. нативная белая от стрелок клавиатуры)
+   не нужна и только дублирует это же состояние */
+.rotate-control #rotate-slider:focus {
+  outline: none;
+}
+
 .rotate-control #rotate-value {
   cursor: pointer;
+  display: inline-block;
+  width: 4.2em; /* фиксированная ширина — иначе смена цифр (например "0.0°" -> "-12.3°")
+                   меняет ширину всего блока и из-за justify-content:flex-end у тулбара
+                   дёргает влево-вправо весь ряд вместе с ползунком */
+  text-align: right;
+}
+
+.text-icon-btn {
+  font-size: 1.15rem;
 }
 
 .aspect-control select {
@@ -354,6 +661,12 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .aspect-control select:disabled {
   opacity: 0.4;
+}
+
+/* активность видна по подсвеченной кнопке "рамка обрезки" рядом — свой синий контур
+   фокуса на самом select только дублирует это же состояние и не нужен */
+.aspect-control select:focus {
+  outline: none;
 }
 
 .modal {
@@ -423,6 +736,37 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .modal-content a { color: var(--accent); text-decoration: none; }
 .modal-content a:hover { text-decoration: underline; }
+
+.unsaved-modal-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.text-btn {
+  width: auto;
+  height: auto;
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: #1b1b1f;
+  color: var(--text);
+  border: 1px solid #3a3a42;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.text-btn:hover {
+  border-color: var(--accent);
+}
+
+.text-btn-primary {
+  background: var(--accent);
+  color: #1b1b1f;
+  border-color: var(--accent);
+  font-weight: 600;
+}
 
 .modal-close {
   position: absolute;

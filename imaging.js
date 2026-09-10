@@ -1,19 +1,33 @@
 // Чистые функции: поворот, кроп, автоулучшение, экспорт. Не зависят от DOM-состояния приложения.
 
-function rectForAspect(photoW, photoH, aspectW, aspectH) {
-  const targetRatio = aspectW / aspectH;
-  let w = photoW;
-  let h = w / targetRatio;
-  if (h > photoH) {
-    h = photoH;
-    w = h * targetRatio;
-  }
-  return {
-    x: (photoW - w) / 2,
-    y: (photoH - h) / 2,
-    w,
-    h,
-  };
+// поворачивает bitmap на 90°×quarterTurns (1 = по часовой, -1/3 = против часовой) —
+// возвращает canvas с уже впечатанным в пиксели новым положением (для жёсткого поворота,
+// в отличие от drawRotatedAt, который крутит только при отрисовке, не меняя сами данные)
+function rotateBitmapQuarter(bitmap, quarterTurns) {
+  const q = ((quarterTurns % 4) + 4) % 4;
+  const swapped = q === 1 || q === 3;
+  const w = bitmap.width, h = bitmap.height;
+  const out = document.createElement("canvas");
+  out.width = swapped ? h : w;
+  out.height = swapped ? w : h;
+  const octx = out.getContext("2d");
+  octx.translate(out.width / 2, out.height / 2);
+  octx.rotate((q * 90 * Math.PI) / 180);
+  octx.drawImage(bitmap, -w / 2, -h / 2);
+  return out;
+}
+
+// зеркально отражает bitmap по горизонтали (впечатывая в пиксели, как rotateBitmapQuarter)
+function flipBitmapHorizontal(bitmap) {
+  const w = bitmap.width, h = bitmap.height;
+  const out = document.createElement("canvas");
+  out.width = w;
+  out.height = h;
+  const octx = out.getContext("2d");
+  octx.translate(w, 0);
+  octx.scale(-1, 1);
+  octx.drawImage(bitmap, 0, 0);
+  return out;
 }
 
 function drawRotated(ctx, bitmap, angleDeg) {
@@ -21,9 +35,17 @@ function drawRotated(ctx, bitmap, angleDeg) {
   const h = bitmap.height;
   ctx.canvas.width = w;
   ctx.canvas.height = h;
-  ctx.save();
   ctx.clearRect(0, 0, w, h);
-  ctx.translate(w / 2, h / 2);
+  drawRotatedAt(ctx, bitmap, angleDeg, 0, 0);
+}
+
+// как drawRotated, но не трогает размер canvas и рисует со смещением (offsetX, offsetY) —
+// нужно, когда canvas больше самого изображения (например, из-за отступа под ручки рамки)
+function drawRotatedAt(ctx, bitmap, angleDeg, offsetX, offsetY) {
+  const w = bitmap.width;
+  const h = bitmap.height;
+  ctx.save();
+  ctx.translate(offsetX + w / 2, offsetY + h / 2);
   ctx.rotate((angleDeg * Math.PI) / 180);
   ctx.drawImage(bitmap, -w / 2, -h / 2, w, h);
   ctx.restore();
@@ -62,9 +84,10 @@ function applyWarmth(imgData, amount) {
   }
 }
 
-// Проекция единичного квадрата (0,0)-(1,0)-(1,1)-(0,1) на произвольный четырёхугольник quad
-// (углы в том же порядке: TL, TR, BR, BL). Классическая формула Хекберта для перспективного варпа.
-function computeSquareToQuad(quad) {
+// Коэффициенты перспективной проекции единичного квадрата (0,0)-(1,0)-(1,1)-(0,1) на
+// произвольный четырёхугольник quad (углы TL, TR, BR, BL) — классическая формула Хекберта.
+// Задают проективную матрицу M = [[a,b,c],[d,e,f],[g,h,1]]: [x,y,w]^T ~ M·[u,v,1]^T.
+function squareToQuadCoeffs(quad) {
   const [p0, p1, p2, p3] = quad;
   const dx1 = p1.x - p2.x, dx2 = p3.x - p2.x, dx3 = p0.x - p1.x + p2.x - p3.x;
   const dy1 = p1.y - p2.y, dy2 = p3.y - p2.y, dy3 = p0.y - p1.y + p2.y - p3.y;
@@ -85,16 +108,48 @@ function computeSquareToQuad(quad) {
     e = p3.y - p0.y + h * p3.y;
     f = p0.y;
   }
+  return { a, b, c, d, e, f, g, h };
+}
 
+// Прямое отображение: по точке (u,v) единичного квадрата [0,1]x[0,1] находит соответствующую
+// точку внутри quad — нужно не для сэмплинга пикселей (см. warpRectToQuad/computeQuadToSquare
+// для этого), а для того, чтобы узнать, куда деформация переносит ЛЮБУЮ конкретную точку
+// исходного прямоугольника (например, его собственные углы или углы уже повёрнутого фото) —
+// то есть где на экране в итоге оказывается видимая (непрозрачная) граница фото.
+function mapUnitSquareToQuad(quad) {
+  const { a, b, c, d, e, f, g, h } = squareToQuadCoeffs(quad);
   return (u, v) => {
     const denom = g * u + h * v + 1;
     return { x: (a * u + b * v + c) / denom, y: (d * u + e * v + f) / denom };
   };
 }
 
-// Переносит область quad (произвольный четырёхугольник в координатах sourceCanvas)
-// в прямоугольник outW×outH с исправлением перспективы (билинейная выборка пикселей).
-function warpQuadToRect(sourceCanvas, quad, outW, outH) {
+// Обратное отображение: по точке на выходном канвасе находит (u,v) в исходном
+// неповёрнутом прямоугольнике [0,1]x[0,1], который перспективная проекция переводит в эту
+// точку quad — то есть инверсия squareToQuadCoeffs как проективной 3x3-матрицы. Нужна для
+// рендера: для каждого пикселя ВЫХОДНОГО изображения ищем, какой пиксель ИСХОДНОГО (фото)
+// туда попадает, а не наоборот.
+function computeQuadToSquare(quad) {
+  const { a, b, c, d, e, f, g, h } = squareToQuadCoeffs(quad);
+  // M = [[a,b,c],[d,e,f],[g,h,1]], аналитическая инверсия 3x3 через матрицу кофакторов
+  const det = a * (e * 1 - f * h) - b * (d * 1 - f * g) + c * (d * h - e * g);
+  const i00 = (e * 1 - f * h) / det, i01 = (c * h - b * 1) / det, i02 = (b * f - c * e) / det;
+  const i10 = (f * g - d * 1) / det, i11 = (a * 1 - c * g) / det, i12 = (c * d - a * f) / det;
+  const i20 = (d * h - e * g) / det, i21 = (b * g - a * h) / det, i22 = (a * e - b * d) / det;
+
+  return (x, y) => {
+    const w = i20 * x + i21 * y + i22;
+    return { u: (i00 * x + i01 * y + i02) / w, v: (i10 * x + i11 * y + i12) / w };
+  };
+}
+
+// Деформирует всё изображение sourceCanvas целиком так, что его собственные 4 угла
+// (прямоугольник 0..sw x 0..sh) переходят в точки quad (заданные в тех же координатах,
+// сами точки могут лежать и за пределами sourceCanvas — это тянет угол наружу).
+// Результат — канвас outW×outH (как правило, того же размера, что и исходный, без обрезки):
+// это аналог поворота фото — искажает картинку целиком, а получившиеся пустые места
+// (прозрачные) обрезает уже отдельная, уже существующая рамка обрезки, а не сама эта функция.
+function warpRectToQuad(sourceCanvas, quad, outW, outH) {
   const sw = sourceCanvas.width, sh = sourceCanvas.height;
   const srcData = sourceCanvas.getContext("2d").getImageData(0, 0, sw, sh).data;
 
@@ -105,15 +160,18 @@ function warpQuadToRect(sourceCanvas, quad, outW, outH) {
   const outImg = octx.createImageData(outW, outH);
   const outData = outImg.data;
 
-  const mapUV = computeSquareToQuad(quad);
+  const invUV = computeQuadToSquare(quad);
 
   for (let py = 0; py < outH; py++) {
-    const v = (py + 0.5) / outH;
     for (let px = 0; px < outW; px++) {
-      const u = (px + 0.5) / outW;
-      const { x, y } = mapUV(u, v);
+      const { u, v } = invUV(px + 0.5, py + 0.5);
       const outIdx = (py * outW + px) * 4;
 
+      if (u < 0 || u > 1 || v < 0 || v > 1) {
+        outData[outIdx + 3] = 0;
+        continue;
+      }
+      const x = u * sw, y = v * sh;
       if (x < 0 || x >= sw - 1 || y < 0 || y >= sh - 1) {
         outData[outIdx + 3] = 0;
         continue;
@@ -135,22 +193,6 @@ function warpQuadToRect(sourceCanvas, quad, outW, outH) {
   }
 
   octx.putImageData(outImg, 0, 0);
-  return out;
-}
-
-// Коррекция перспективы + принудительное соотношение сторон aspectW:aspectH + цветокоррекция —
-// высота результата берётся из средней длины левой/правой стороны четырёхугольника.
-function exportPerspectiveCrop(sourceCanvas, quad, aspectW, aspectH, colorOpts = {}) {
-  const leftLen = Math.hypot(quad[3].x - quad[0].x, quad[3].y - quad[0].y);
-  const rightLen = Math.hypot(quad[2].x - quad[1].x, quad[2].y - quad[1].y);
-  const outH = Math.max(1, Math.round((leftLen + rightLen) / 2));
-  const outW = Math.max(1, Math.round(outH * (aspectW / aspectH)));
-
-  const out = warpQuadToRect(sourceCanvas, quad, outW, outH);
-  const octx = out.getContext("2d");
-  const imgData = octx.getImageData(0, 0, out.width, out.height);
-  applyColorTreatment(imgData, colorOpts);
-  octx.putImageData(imgData, 0, 0);
   return out;
 }
 

@@ -12,6 +12,11 @@ const ASPECT_PRESETS = [
   { key: "16x9", w: 16, h: 9 },
 ];
 const ASPECT_STORAGE_KEY = "cropAspect";
+const AUTO_HORIZON_STORAGE_KEY = "autoHorizonEnabled";
+const PANEL_MODE_STORAGE_KEY = "albumPanelMode";
+// если детектор нашёл "уверенную" линию, но угол больше этого — почти наверняка за горизонт
+// приняли что-то другое (кромку предмета, диагональ переднего плана), лучше пропустить как ошибку
+const AUTO_HORIZON_MAX_ANGLE = 5;
 const ORIGINALS_DIR = ".Originals";
 const ALBUM_SUFFIX = "-Albom";
 
@@ -27,11 +32,16 @@ const el = (id) => document.getElementById(id);
 
 const State = {
   rootHandle: null, // верхняя папка, выбранная через "Открыть альбом" — корень дерева слева
-  folderParents: new Map(), // handle подпапки -> handle родителя, для кнопки "уровень выше"
   folderRows: new Map(), // handle -> DOM-строка в дереве, для подсветки при навигации вверх
+  folderParents: new Map(), // handle -> родительский handle, для построения именного пути к узлу
+  folderExpanders: new Map(), // handle -> loadChildren() этого узла, чтобы дойти до вложенной папки программно
+  folderChildren: new Map(), // handle -> актуальный список дочерних handle'ов узла после последней подгрузки
+  treeBuildPromise: null, // промис текущей buildFolderTree — чтобы дождаться дерева перед восстановлением фокуса
+  albumGeneration: 0, // счётчик открытий альбома — чтобы фоновая генерация миниатюр прошлого альбома не писала в чужую сетку
   albumHandle: null,
   originalsHandle: null, // создаётся лениво, только при первом сохранении
   curatedHandle: null, // папка "<альбом>-Albom" — создаётся лениво при первой звёздочке/сохранении
+  curatedDirName: null, // реальное имя этой папки на диске (см. scanFiles — переживает переименование родителя)
   queue: [], // [{name, handle, edited, starred, thumbUrl}]
   index: -1,
   fullBitmap: null,
@@ -40,21 +50,86 @@ const State = {
   previewH: 0,
   rotationDeg: 0,
   cropRect: null, // {x,y,w,h} в координатах preview-канваса
-  verticals: [],
   dragMode: null, // 'move' | 'resize' | 'perspective-corner'
   dragCorner: null, // 0..3
   dragStart: null,
   dirty: false, // есть несохранённые правки текущего фото
+  exifDirty: false, // отдельно: правки метаданных (дата/производитель/гео) — не сбрасываются авто-пересчётом dirty по кадру/углу
+  netQuarterTurns: 0, // сумма поворотов на 90° по модулю 4 — если пользователь повернул и вернул обратно, кадр не считается изменённым
+  netFlipped: false, // то же самое для разворота по горизонтали
   showGrid: false,
+  autoHorizonEnabled: true, // кнопка-переключатель "⚖" — подбирать ли угол горизонта автоматически; запоминается между сессиями
   aspect: ASPECT_PRESETS[0], // формат кадра — выбирается один раз и запоминается между фото/сессиями
+  cropVisible: false, // рамка обрезки видна только когда явно включена кнопкой — не мешает смотреть фото
   perspectiveMode: false,
   perspectiveQuad: null, // [{x,y}×4] TL,TR,BR,BL в координатах preview-канваса
   colorVariant: COLOR_VARIANTS[1],
   colorPickerActive: false,
+  currentGeo: null, // {lat, lon} текущего фото — для кнопки "Открыть карту"
+  currentExif: null, // разобранный EXIF текущего фото — чтобы вернуть камеру/GPS в файл при сохранении
+  mapWindow: null, // ссылка на открытое окно карты, чтобы обновлять его при смене фото
+  previewZoom: 1, // масштаб превью в canvas-wrap, меняется колесом мыши
+  copyMode: false, // режим редактирования параметров: кнопки копирования + редактируемые поля
+  updateGpsRow: null, // колбэк, которым клик по карте обновляет отображение строки GPS
+  albumGeo: [], // [{lat,lon}|null, ...] — координаты всех фото альбома, параллельно State.queue
+  rootAbsolutePath: null, // путь на диске к State.rootHandle — только для кнопки "открыть в Проводнике"
+  musicFiles: [], // аудиофайлы из папки "Music" в корне дерева — фон для слайдшоу, необязательны
+  musicRootHandle: null, // rootHandle, для которого уже просканирована папка "Music" — чтобы не пересканировать при каждом запуске слайдшоу
+  loadGeneration: 0, // счётчик вызовов loadPhoto — чтобы отменённый в процессе (быстрое пролистывание) вызов не переписал состояние поверх уже открытого следующего фото
 };
 
 const canvas = () => el("photo-canvas");
 const ctx = () => canvas().getContext("2d");
+
+// задаёт видимый размер явными px (а не transform: scale от "auto"-размера) — только так
+// CSS-переход у #photo-canvas умеет плавно анимировать смену размера между фото разной
+// ориентации/пропорций, вместо мгновенного скачка
+function setPreviewZoom(zoom) {
+  State.previewZoom = Math.max(0.05, zoom);
+  const c = canvas();
+  c.style.width = Math.round(State.previewW * State.previewZoom) + "px";
+  c.style.height = Math.round(State.previewH * State.previewZoom) + "px";
+}
+
+// растягивает фото на всё окно альбома (canvas-wrap) при открытии, без обрезки — масштаб
+// считается заранее по известным размерам превью и контейнера, а не измерением текущего
+// отображаемого canvas: так не бывает промежуточного кадра с "неправильным" размером,
+// который мелькал бы при каждой смене фото
+function fitPreviewToWindow() {
+  applyFitToWindow();
+  // на самый первый вызов после открытия альбома и на самый первый вход в fullscreen layout
+  // иногда ещё не устоялся (панели/дерево слева, переход в fullscreen) — размеры canvas-wrap,
+  // снятые синхронно прямо тут, могут быть ещё старыми. Следующие фото и следующие входы в
+  // fullscreen уже не задевает: к тому моменту layout давно устоялся. Досчитываем ещё раз
+  // кадром позже, когда браузер точно применил актуальный layout — если первый расчёт и так
+  // был верным, это просто безобидный повтор
+  requestAnimationFrame(applyFitToWindow);
+}
+
+// то же самое, но первый расчёт применяется без CSS-анимации — специально для смены самого
+// фото (см. loadPhoto). У разных фото разные пропорции кадра, а transition: width/height
+// анимирует их по отдельности: ширина и высота едут к новым значениям каждая сама по себе,
+// и на середине перехода мелькают "неправильные" промежуточные пропорции — новое фото на
+// долю секунды выглядит сплющенным в форму предыдущего кадра. Поэтому сама смена фото должна
+// вставать сразу; для одного и того же фото (вход/выход из fullscreen, resize окна, зум
+// колесом) пропорция не меняется — там ширина и высота едут синхронно, деформации не бывает,
+// и такие изменения по-прежнему смягчает transition через обычный fitPreviewToWindow
+function fitPreviewToWindowInstant() {
+  const c = canvas();
+  c.style.transition = "none";
+  applyFitToWindow();
+  void c.offsetHeight; // форсируем reflow, чтобы размер применился без анимации до возврата transition
+  c.style.transition = "";
+  // подстраховочный пересчёт кадром позже (см. fitPreviewToWindow) — это уже не смена фото,
+  // а уточнение по устоявшемуся layout для того же фото, там анимация уместна
+  requestAnimationFrame(applyFitToWindow);
+}
+
+function applyFitToWindow() {
+  const wrap = el("canvas-wrap");
+  if (!State.previewW || !State.previewH || wrap.clientWidth === 0 || wrap.clientHeight === 0) return;
+  setPreviewZoom(Math.min(wrap.clientWidth / State.previewW, wrap.clientHeight / State.previewH));
+}
 
 function setStatus(id, text) {
   el(id).textContent = text;
@@ -69,23 +144,37 @@ async function pickAlbum() {
     return;
   }
   State.rootHandle = null; // новый ручной выбор — новый корень дерева слева
+  // путь до сфокусированного альбома сбрасываем именно здесь (а не в openAlbum) — там же
+  // проходит и восстановление сессии при запуске, которое не должно затирать сохранённый путь
+  try {
+    await idbSet("lastFocusedPath", []);
+  } catch (_) {
+    // необязательная удобная фича
+  }
   await openAlbum(handle);
 }
 
 async function openAlbum(handle) {
+  const generation = ++State.albumGeneration; // помечаем это открытие — если пока грузимся, откроют ещё один альбом, наш фон должен это заметить и остановиться
   State.albumHandle = handle;
   State.originalsHandle = null;
   State.curatedHandle = null;
-  el("refresh-album-btn").hidden = false;
+  State.curatedDirName = null; // реальное имя папки "-Albom" на диске — узнаём при сканировании
   el("continue-album-btn").hidden = true;
 
   if (!State.rootHandle) {
     State.rootHandle = handle;
-    buildFolderTree(handle).catch((e) => console.error("Ошибка построения дерева папок", e));
+    State.treeBuildPromise = buildFolderTree(handle).catch((e) => console.error("Ошибка построения дерева папок", e));
+    // запоминаем корень дерева — при следующем запуске дерево слева строится от этой же папки
+    try {
+      await idbSet("lastRoot", handle);
+    } catch (_) {
+      // хранение хендла — необязательная удобная фича, не должна ломать открытие альбома
+    }
   }
-  el("up-dir-btn").disabled = !State.folderParents.has(handle);
 
   await scanFiles();
+  State.albumGeo = new Array(State.queue.length).fill(null);
   if (State.queue.length === 0) {
     setStatus("status-bar", "В этой папке нет фото (jpg/png). Выберите папку слева.");
     el("album-grid").innerHTML = "";
@@ -96,29 +185,29 @@ async function openAlbum(handle) {
   }
 
   buildGrid();
-  generateThumbnails();
+  generateThumbnails(generation);
+  collectAlbumGeo(generation);
   setPhotoControlsEnabled(true);
   State.index = -1;
   await selectPhoto(0);
-
-  try {
-    await idbSet("lastAlbum", handle);
-  } catch (_) {
-    // хранение хендла — необязательная удобная фича, не должна ломать открытие альбома
-  }
 }
 
 function setPhotoControlsEnabled(enabled) {
-  ["reset-btn", "star-btn", "prev-btn", "next-btn", "save-btn", "rotate-slider", "rotate-toggle-btn", "grid-btn", "perspective-btn", "color-btn", "aspect-select"].forEach((id) => {
+  ["reset-btn", "star-btn", "prev-btn", "next-btn", "slideshow-btn", "fullscreen-btn", "rotate-slider", "rotate-toggle-btn", "auto-horizon-btn", "rotate-left-btn", "rotate-right-btn", "flip-btn", "grid-btn", "perspective-btn", "color-btn", "aspect-select", "properties-edit-btn"].forEach((id) => {
     el(id).disabled = !enabled;
   });
+  // "сохранить" не входит в общий список — её включённость решает не сам факт открытия
+  // фото, а refreshDirty() (есть ли реальные несохранённые правки); тут гасим только
+  // на выключение, включение при загрузке фото отдаётся refreshDirty() из loadPhoto()
+  if (!enabled) el("save-btn").disabled = true;
 }
 
 // временно блокирует остальные элементы управления, пока открыт подбор цветовых вариантов
 function freezeEditingControls(frozen) {
-  ["reset-btn", "star-btn", "prev-btn", "next-btn", "save-btn", "rotate-slider", "rotate-toggle-btn", "grid-btn", "perspective-btn", "aspect-select"].forEach((id) => {
+  ["reset-btn", "star-btn", "prev-btn", "next-btn", "slideshow-btn", "fullscreen-btn", "rotate-slider", "rotate-toggle-btn", "auto-horizon-btn", "rotate-left-btn", "rotate-right-btn", "flip-btn", "grid-btn", "perspective-btn", "aspect-select"].forEach((id) => {
     el(id).disabled = frozen;
   });
+  el("save-btn").disabled = frozen || !State.dirty;
   if (!frozen && State.index >= 0) {
     el("restore-btn").disabled = !State.queue[State.index].edited;
   } else {
@@ -126,11 +215,12 @@ function freezeEditingControls(frozen) {
   }
 }
 
-// подпапки текущей папки для дерева слева — служебные ".Originals" и "*-Albom" в дереве не нужны
+// подпапки текущей папки для дерева слева — скрываем только служебную ".Originals";
+// curated-подпапки "<имя>-Albom" в дереве не прячем — это тоже альбомы, их наличие должно быть видно
 async function listSubdirectories(dirHandle) {
   const dirs = [];
   for await (const entry of dirHandle.values()) {
-    if (entry.kind === "directory" && entry.name !== ORIGINALS_DIR && !entry.name.endsWith(ALBUM_SUFFIX)) {
+    if (entry.kind === "directory" && entry.name !== ORIGINALS_DIR) {
       dirs.push(entry);
     }
   }
@@ -157,45 +247,68 @@ async function createFolderNode(handle, opts = {}) {
   row.appendChild(name);
   li.appendChild(row);
 
+  if (opts.parent) State.folderParents.set(handle, opts.parent);
   State.folderRows.set(handle, row);
-
-  // сканируем подпапки сразу при создании узла, чтобы стрелка раскрытия
-  // с самого начала показывала, есть ли вложенные папки, а не пропадала после клика
-  const subdirs = await listSubdirectories(handle);
-  for (const sub of subdirs) State.folderParents.set(sub, handle);
-  toggle.textContent = subdirs.length ? "▸" : "";
 
   let childList = null;
   let loaded = false;
 
+  // содержимое узла подгружается лениво — только когда его раскрывают стрелкой (или это
+  // корень дерева). Пересканирует подпапки заново при каждом раскрытии, так что свежесозданные/
+  // удалённые папки на диске подтягиваются, не пересобирая всё дерево целиком.
   async function loadChildren() {
-    if (loaded || subdirs.length === 0) return;
+    const subdirs = await listSubdirectories(handle);
+    State.folderChildren.set(handle, subdirs);
+    toggle.textContent = subdirs.length ? "▾" : "";
     loaded = true;
-    childList = document.createElement("ul");
-    childList.className = "folder-tree-list";
-    for (const sub of subdirs) {
-      childList.appendChild(await createFolderNode(sub));
+    if (subdirs.length === 0) return; // у листа нет смысла создавать пустой childList
+    if (!childList) {
+      childList = document.createElement("ul");
+      childList.className = "folder-tree-list";
+      li.appendChild(childList);
     }
-    li.appendChild(childList);
-    toggle.textContent = "▾";
+    childList.innerHTML = "";
+    childList.hidden = false;
+    for (const sub of subdirs) {
+      childList.appendChild(await createFolderNode(sub, { parent: handle }));
+    }
   }
+  State.folderExpanders.set(handle, loadChildren);
+
+  const initialSubdirs = await listSubdirectories(handle);
+  toggle.textContent = initialSubdirs.length ? "▸" : "";
 
   toggle.addEventListener("click", async (evt) => {
     evt.stopPropagation();
-    if (subdirs.length === 0) return;
+    if (initialSubdirs.length === 0 && !loaded) return;
     if (!loaded) {
       await loadChildren();
       return;
     }
-    if (childList) {
-      childList.hidden = !childList.hidden;
-      toggle.textContent = childList.hidden ? "▸" : "▾";
+    childList.hidden = !childList.hidden;
+    toggle.textContent = childList.hidden ? "▸" : "▾";
+  });
+
+  name.addEventListener("click", async (evt) => {
+    if (evt.detail > 1) return; // часть двойного клика — открытие в Проводнике, см. ниже
+    highlightFolderRow(row);
+    if (!loaded) await loadChildren(); // сразу показываем вложенные папки открываемого альбома, не только по клику на стрелку
+    await openAlbum(handle);
+    // путь запоминаем только по реальному клику в дереве — так восстановление фокуса
+    // (которое само открывает альбомы программно) не перетирает его неполным путём
+    try {
+      await idbSet("lastFocusedPath", folderNamePath(handle));
+    } catch (_) {
+      // необязательная удобная фича
     }
   });
 
-  name.addEventListener("click", async () => {
-    highlightFolderRow(row);
-    await openAlbum(handle);
+  // File System Access API нарочно не даёт узнать реальный путь папки на диске — поэтому
+  // для открытия в Проводнике путь строится из имён (folderNamePath) поверх абсолютного пути
+  // корня, который пользователя просят указать один раз (см. ensureRootAbsolutePath)
+  row.addEventListener("dblclick", (evt) => {
+    evt.preventDefault();
+    openFolderInExplorer(handle);
   });
 
   if (opts.expanded) await loadChildren();
@@ -203,22 +316,90 @@ async function createFolderNode(handle, opts = {}) {
   return li;
 }
 
-async function navigateUp() {
-  const parent = State.folderParents.get(State.albumHandle);
-  if (!parent) return;
-  const row = State.folderRows.get(parent);
-  if (row) highlightFolderRow(row);
-  await openAlbum(parent);
-}
-
 function highlightFolderRow(row) {
   el("folder-tree").querySelectorAll(".folder-node-row.active").forEach((r) => r.classList.remove("active"));
   row.classList.add("active");
 }
 
+// путь именами папок от корня дерева до данного (живого, из текущей сессии) handle'а —
+// хранится и сравнивается по именам, а не по самому handle'у, так как handle'ы, прочитанные
+// из IndexedDB отдельно, никогда не будут той же ссылкой, что и живые узлы дерева
+function folderNamePath(handle) {
+  const names = [];
+  let current = handle;
+  while (current && current !== State.rootHandle) {
+    names.unshift(current.name);
+    current = State.folderParents.get(current);
+  }
+  return names;
+}
+
+// File System Access API намеренно не отдаёт странице реальный путь папки на диске (это
+// решение безопасности браузера, а не забытая фича) — поэтому единственный способ открыть
+// Проводник на нужной папке это спросить у пользователя абсолютный путь к корню один раз
+// и дальше достраивать его именами подпапок (folderNamePath). Запоминаем ответ в IndexedDB
+// вместе с именем корня, чтобы при том же альбоме больше не спрашивать.
+async function ensureRootAbsolutePath() {
+  if (State.rootAbsolutePath) return State.rootAbsolutePath;
+  try {
+    const savedPath = await idbGet("rootAbsolutePath");
+    const savedName = await idbGet("rootAbsolutePathName");
+    if (savedPath && savedName === State.rootHandle.name) {
+      State.rootAbsolutePath = savedPath;
+      return savedPath;
+    }
+  } catch (_) {
+    // необязательная удобная фича
+  }
+  const input = prompt(`Открытие в Проводнике: укажите полный путь на диске к папке "${State.rootHandle.name}" (спрашивается один раз для этого альбома).`, "");
+  if (!input) return null;
+  State.rootAbsolutePath = input.replace(/[\\/]+$/, "");
+  try {
+    await idbSet("rootAbsolutePath", State.rootAbsolutePath);
+    await idbSet("rootAbsolutePathName", State.rootHandle.name);
+  } catch (_) {
+    // необязательная удобная фича
+  }
+  return State.rootAbsolutePath;
+}
+
+async function openFolderInExplorer(handle) {
+  const rootPath = await ensureRootAbsolutePath();
+  if (!rootPath) return;
+  const fullPath = [rootPath, ...folderNamePath(handle)].join("\\");
+  try {
+    const res = await fetch("/__open_in_explorer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: fullPath }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+  } catch (e) {
+    setStatus("status-bar", "Не удалось открыть Проводник: " + e.message);
+  }
+}
+
+// идёт от корня вниз по именам папок, на каждом шаге дожидаясь подгрузки узла — так дерево
+// визуально раскрывается до нужной папки, а на выходе получаем живой handle текущей сессии
+async function expandTreeToPath(namesPath) {
+  let current = State.rootHandle;
+  for (const name of namesPath) {
+    const expand = State.folderExpanders.get(current);
+    if (!expand) break;
+    await expand();
+    const children = State.folderChildren.get(current) || [];
+    const next = children.find((h) => h.name === name);
+    if (!next) break;
+    current = next;
+  }
+  return current;
+}
+
 async function buildFolderTree(rootHandle) {
-  State.folderParents = new Map();
   State.folderRows = new Map();
+  State.folderParents = new Map();
+  State.folderExpanders = new Map();
+  State.folderChildren = new Map();
   const container = el("folder-tree");
   container.innerHTML = "";
   const list = document.createElement("ul");
@@ -233,31 +414,36 @@ async function buildFolderTree(rootHandle) {
 // не заставлять заново выбирать альбом через системный диалог
 const IDB_NAME = "photo-editor-db";
 const IDB_STORE = "handles";
+const IDB_THUMB_STORE = "thumbnails"; // кэш готовых миниатюр — переживает перезапуск, не даёт перекодировать неизменившиеся фото заново
 
 function idbOpen() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDB_NAME, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    const req = indexedDB.open(IDB_NAME, 2);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      if (!db.objectStoreNames.contains(IDB_THUMB_STORE)) db.createObjectStore(IDB_THUMB_STORE);
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
 
-async function idbSet(key, value) {
+async function idbSet(key, value, store = IDB_STORE) {
   const db = await idbOpen();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    tx.objectStore(IDB_STORE).put(value, key);
+    const tx = db.transaction(store, "readwrite");
+    tx.objectStore(store).put(value, key);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
 }
 
-async function idbGet(key) {
+async function idbGet(key, store = IDB_STORE) {
   const db = await idbOpen();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, "readonly");
-    const req = tx.objectStore(IDB_STORE).get(key);
+    const tx = db.transaction(store, "readonly");
+    const req = tx.objectStore(store).get(key);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -269,7 +455,7 @@ async function idbGet(key) {
 async function tryRestoreLastAlbum() {
   let handle;
   try {
-    handle = await idbGet("lastAlbum");
+    handle = await idbGet("lastRoot");
   } catch (_) {
     return;
   }
@@ -285,6 +471,7 @@ async function tryRestoreLastAlbum() {
   if (perm === "granted") {
     State.rootHandle = null;
     await openAlbum(handle);
+    await restoreFocusInTree();
     return;
   }
 
@@ -298,6 +485,7 @@ async function tryRestoreLastAlbum() {
         btn.hidden = true;
         State.rootHandle = null;
         await openAlbum(handle);
+        await restoreFocusInTree();
       } else {
         setStatus("status-bar", "Доступ к папке не разрешён.");
       }
@@ -307,36 +495,45 @@ async function tryRestoreLastAlbum() {
   };
 }
 
-async function refreshAlbum() {
-  if (!State.albumHandle) return;
-  const currentName = State.index >= 0 ? State.queue[State.index].name : null;
-
-  await scanFiles();
-  if (State.queue.length === 0) {
-    setStatus("status-bar", "В этой папке нет фото (jpg/png).");
-    el("album-grid").innerHTML = "";
-    clearPropertiesPanel();
-    State.index = -1;
-    setPhotoControlsEnabled(false);
+// дожидается построения дерева и раскрывает его вниз по сохранённому именному пути до
+// последнего открытого альбома — раскрытый путь даёт живой handle текущей сессии, поэтому
+// с ним можно и подсветить строку в дереве, и просто открыть альбом без отдельного
+// запроса разрешения (это уже живой потомок корня, разрешение которого только что получено)
+async function restoreFocusInTree() {
+  try {
+    await State.treeBuildPromise;
+  } catch (_) {
     return;
   }
+  let path;
+  try {
+    path = await idbGet("lastFocusedPath");
+  } catch (_) {
+    return;
+  }
+  if (!path || path.length === 0) return;
 
-  buildGrid();
-  generateThumbnails();
-  setPhotoControlsEnabled(true);
-  const idx = currentName ? State.queue.findIndex((q) => q.name === currentName) : -1;
-  State.index = -1;
-  await selectPhoto(idx >= 0 ? idx : 0);
+  const target = await expandTreeToPath(path);
+  if (!target || target === State.rootHandle) return;
+
+  const row = State.folderRows.get(target);
+  if (row) highlightFolderRow(row);
+  await openAlbum(target);
 }
 
 async function scanFiles() {
   setStatus("status-bar", "Сканирую альбом...");
   const imageRe = /\.(jpe?g|png)$/i;
   const files = [];
+  let curatedDirName = null;
   for await (const entry of State.albumHandle.values()) {
     if (entry.kind === "file" && imageRe.test(entry.name)) files.push(entry);
+    // ищем подпапку "-Albom" по факту, а не по совпадению с текущим именем родителя —
+    // если саму папку альбома переименовали в проводнике, старая подпапка сохранит старое имя
+    else if (entry.kind === "directory" && entry.name.endsWith(ALBUM_SUFFIX)) curatedDirName = entry.name;
   }
   files.sort((a, b) => a.name.localeCompare(b.name));
+  State.curatedDirName = curatedDirName;
 
   let originalsHandle = null;
   const backupNames = new Set();
@@ -350,13 +547,15 @@ async function scanFiles() {
   }
 
   const curatedNames = new Set();
-  try {
-    const curatedHandle = await State.albumHandle.getDirectoryHandle(State.albumHandle.name + ALBUM_SUFFIX);
-    for await (const entry of curatedHandle.values()) {
-      if (entry.kind === "file") curatedNames.add(entry.name);
+  if (curatedDirName) {
+    try {
+      const curatedHandle = await State.albumHandle.getDirectoryHandle(curatedDirName);
+      for await (const entry of curatedHandle.values()) {
+        if (entry.kind === "file") curatedNames.add(entry.name);
+      }
+    } catch (_) {
+      // не должно случиться — только что нашли эту папку в перечислении выше
     }
-  } catch (_) {
-    // папки "-Albom" ещё нет — значит ничего не отмечали звёздочкой
   }
 
   State.queue = [];
@@ -390,14 +589,27 @@ function buildGrid() {
   State.queue.forEach((item, i) => {
     const btn = document.createElement("button");
     btn.className = "thumb";
+    // порядок миниатюры в ленте — на случай бокового режима, где она физически переезжает
+    // внутрь одной из .thumb-col обёрток (см. layoutRightColumns) и перестаёт быть прямым
+    // ребёнком #album-grid по индексу в DOM
+    btn.dataset.index = i;
     const img = document.createElement("img");
     img.alt = item.name;
     btn.appendChild(img);
     if (item.edited) btn.appendChild(makeEditedBadge());
     if (item.starred) btn.appendChild(makeStarBadge());
+    // без этого клик мышью оставляет на кнопке нативную рамку фокуса — она никуда не девается
+    // при листании стрелками (та листает фото глобальным keydown, а не тем, что реально
+    // сфокусировано), и в итоге рядом с нашей синей рамкой активного кадра виснет ещё и белая
+    // на когда-то кликнутой миниатюре; preventDefault на mousedown убирает фокус только по
+    // клику мышью — Tab с клавиатуры по-прежнему фокусирует кнопку как обычно
+    btn.addEventListener("mousedown", (evt) => evt.preventDefault());
     btn.addEventListener("click", () => goToPhoto(i));
     grid.appendChild(btn);
   });
+  // раскладка по столбикам в боковом режиме зависит от количества миниатюр — пересчитываем
+  // при каждой перестройке ленты, а не только при изменении границы
+  updateThumbSizing();
 }
 
 function makeEditedBadge() {
@@ -420,14 +632,24 @@ function makeStarBadge() {
   return badge;
 }
 
+// находит кнопку-миниатюру по индексу фото в очереди — а не по позиции среди детей #album-grid
+// напрямую (grid.children[i]), потому что в боковом режиме миниатюры физически переезжают
+// внутрь обёрток .thumb-col (см. layoutRightColumns) и перестают быть прямыми детьми ленты
+function thumbAt(i) {
+  return el("album-grid").querySelector(`.thumb[data-index="${i}"]`);
+}
+
 function updateThumbImg(i) {
-  const btn = el("album-grid").children[i];
+  const btn = thumbAt(i);
   const img = btn && btn.querySelector("img");
-  if (img && State.queue[i].thumbUrl) img.src = State.queue[i].thumbUrl;
+  if (img && State.queue[i].thumbUrl) {
+    img.src = State.queue[i].thumbUrl;
+    img.classList.add("loaded");
+  }
 }
 
 function updateThumbBadge(i) {
-  const btn = el("album-grid").children[i];
+  const btn = thumbAt(i);
   if (!btn) return;
   const existing = btn.querySelector(".edited-badge");
   if (State.queue[i].edited && !existing) {
@@ -438,7 +660,7 @@ function updateThumbBadge(i) {
 }
 
 function updateThumbStar(i) {
-  const btn = el("album-grid").children[i];
+  const btn = thumbAt(i);
   if (!btn) return;
   const existing = btn.querySelector(".star-badge");
   if (State.queue[i].starred && !existing) {
@@ -456,10 +678,30 @@ function updateStarButton(item) {
 
 function highlightActiveThumb() {
   const grid = el("album-grid");
-  [...grid.children].forEach((c, i) => c.classList.toggle("active", i === State.index));
+  // find() тут не подходит — он останавливается на первом совпадении и не доходит до
+  // миниатюр после него, поэтому при движении назад подсветка с них не снималась; перебираем
+  // все .thumb (а не grid.children напрямую) — в боковом режиме они лежат внутри обёрток
+  // .thumb-col, а не прямыми детьми ленты, зато data-index всегда хранит настоящий индекс фото
+  let active = null;
+  grid.querySelectorAll(".thumb").forEach((c) => {
+    const isActive = +c.dataset.index === State.index;
+    c.classList.toggle("active", isActive);
+    if (isActive) active = c;
+  });
+  // в длинных альбомах активная миниатюра может быть за пределами видимой ленты — центрируем
+  // прокрутку на ней, иначе непонятно, на каком фото сейчас фокус (в боковом режиме лента
+  // листается по вертикали, в нижнем — по горизонтали)
+  if (active) {
+    const right = document.body.classList.contains("panel-right");
+    active.scrollIntoView({
+      inline: right ? "nearest" : "center",
+      block: right ? "center" : "nearest",
+      behavior: "smooth",
+    });
+  }
 }
 
-async function regenerateThumbFromFile(item, fileOrBlob) {
+async function regenerateThumbFromFile(item, fileOrBlob, cacheKey) {
   const bitmap = await createImageBitmap(fileOrBlob, { imageOrientation: "from-image" });
   const scale = Math.min(1, THUMB_MAX / Math.max(bitmap.width, bitmap.height));
   const w = Math.round(bitmap.width * scale);
@@ -471,19 +713,79 @@ async function regenerateThumbFromFile(item, fileOrBlob) {
   const blob = await new Promise((resolve) => c.toBlob(resolve, "image/jpeg", 0.7));
   if (item.thumbUrl) URL.revokeObjectURL(item.thumbUrl);
   item.thumbUrl = URL.createObjectURL(blob);
+  if (cacheKey) {
+    try { await idbSet(cacheKey, blob, IDB_THUMB_STORE); } catch (_) {}
+  }
 }
 
-async function generateThumbnails() {
-  for (let i = 0; i < State.queue.length; i++) {
-    const item = State.queue[i];
-    try {
-      const file = await item.handle.getFile();
-      await regenerateThumbFromFile(item, file);
-      updateThumbImg(i);
-    } catch (e) {
-      // пропускаем неудачную миниатюру, не прерывая остальные
+// ключ по имени+размеру+дате изменения — при реальном изменении файла (правка, восстановление
+// оригинала) он меняется сам собой, так что кэш не может "залипнуть" на устаревшей миниатюре
+function thumbCacheKey(item, file) {
+  return `${item.name}|${file.size}|${file.lastModified}`;
+}
+
+async function generateThumbnails(generation) {
+  const queue = State.queue; // фиксируем ссылку — State.queue может смениться, если пока грузимся, откроют другой альбом
+  const CONCURRENCY = 4; // несколько фото decode/encode'ятся параллельно вместо строго по одному — заметно быстрее на больших альбомах
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      if (State.albumGeneration !== generation) return;
+      const i = nextIndex++;
+      if (i >= queue.length) return;
+      const item = queue[i];
+      try {
+        const file = await item.handle.getFile();
+        const cacheKey = thumbCacheKey(item, file);
+        let cached = null;
+        try { cached = await idbGet(cacheKey, IDB_THUMB_STORE); } catch (_) {}
+        if (State.albumGeneration !== generation) return;
+        if (cached) {
+          if (item.thumbUrl) URL.revokeObjectURL(item.thumbUrl);
+          item.thumbUrl = URL.createObjectURL(cached);
+        } else {
+          await regenerateThumbFromFile(item, file, cacheKey);
+        }
+        if (State.albumGeneration !== generation) return;
+        updateThumbImg(i);
+      } catch (e) {
+        // пропускаем неудачную миниатюру, не прерывая остальные
+      }
     }
   }
+
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker));
+}
+
+// сканирует GPS всех фото альбома в фоне (не только открытого сейчас) — нужно, чтобы карта
+// сразу показывала метки всего альбома, а не только текущего снимка
+async function collectAlbumGeo(generation) {
+  const queue = State.queue;
+  const CONCURRENCY = 4;
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      if (State.albumGeneration !== generation) return;
+      const i = nextIndex++;
+      if (i >= queue.length) return;
+      const item = queue[i];
+      try {
+        const file = await item.handle.getFile();
+        const exif = readExif(await file.arrayBuffer());
+        if (State.albumGeneration !== generation) return;
+        if (exif && exif.lat != null && exif.lon != null) {
+          State.albumGeo[i] = { lat: exif.lat, lon: exif.lon };
+          refreshMaps();
+        }
+      } catch (e) {
+        // пропускаем фото без читаемого EXIF, не прерывая остальные
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker));
 }
 
 async function selectPhoto(i) {
@@ -495,7 +797,41 @@ async function selectPhoto(i) {
   el("progress-label").textContent = `${i + 1} / ${State.queue.length}`;
   el("restore-btn").disabled = !item.edited;
   updateStarButton(item);
-  await loadPhoto(item);
+  await loadPhoto(item); // сам подбирает масштаб под окно, как только известны размеры превью
+}
+
+// три исхода вместо стандартного OK/Cancel — "Отмена" должна реально останавливать переход,
+// а не просто пропускать сохранение
+function askUnsavedChanges(name) {
+  return new Promise((resolve) => {
+    const modal = el("unsaved-modal");
+    el("unsaved-modal-text").textContent = `Сохранить изменения в «${name}» перед переходом?`;
+    const saveBtn = el("unsaved-save-btn");
+    const discardBtn = el("unsaved-discard-btn");
+    const cancelBtn = el("unsaved-cancel-btn");
+
+    const cleanup = (result) => {
+      modal.hidden = true;
+      saveBtn.removeEventListener("click", onSave);
+      discardBtn.removeEventListener("click", onDiscard);
+      cancelBtn.removeEventListener("click", onCancel);
+      modal.removeEventListener("click", onBackdrop);
+      resolve(result);
+    };
+    const onSave = () => cleanup("save");
+    const onDiscard = () => cleanup("discard");
+    const onCancel = () => cleanup("cancel");
+    // клик мимо диалога — безопасный дефолт "не терять правки", как и закрытие модалки "О программе"
+    const onBackdrop = (evt) => {
+      if (evt.target.id === "unsaved-modal") cleanup("cancel");
+    };
+
+    saveBtn.addEventListener("click", onSave);
+    discardBtn.addEventListener("click", onDiscard);
+    cancelBtn.addEventListener("click", onCancel);
+    modal.addEventListener("click", onBackdrop);
+    modal.hidden = false;
+  });
 }
 
 // переход между фото с проверкой несохранённых правок — предлагает сохранить перед уходом
@@ -503,9 +839,9 @@ async function goToPhoto(i) {
   if (i < 0 || i >= State.queue.length || i === State.index) return;
   if (State.dirty) {
     const name = State.queue[State.index].name;
-    if (confirm(`Сохранить изменения в «${name}» перед переходом?`)) {
-      await saveCurrent();
-    }
+    const choice = await askUnsavedChanges(name);
+    if (choice === "cancel") return; // остаёмся на текущем фото
+    if (choice === "save") await saveCurrent();
   }
   await selectPhoto(i);
 }
@@ -518,12 +854,60 @@ function nextPhoto() {
   goToPhoto(State.index + 1);
 }
 
-async function loadPhoto(item) {
-  const file = await item.handle.getFile();
+// presetFile — если данные уже есть в памяти (после restoreOriginal/saveCurrent), берём их
+// напрямую вместо повторного чтения только что записанного файла с диска: сразу после
+// createWritable().close() getFile() иногда ещё отдаёт старое содержимое (кэш хэндла), из-за
+// чего "восстановленное"/только что сохранённое фото визуально не обновлялось
+async function loadPhoto(item, presetFile) {
+  // если пока грузим это фото (await ниже) пользователь успеет пролистнуть дальше, начнётся ещё
+  // один loadPhoto с более новым номером — тогда этот вызов, доделав работу позже того, более
+  // нового, не должен переписать поверх него состояние/статус-бар устаревшими результатами
+  const myGen = ++State.loadGeneration;
+  const file = presetFile || await item.handle.getFile();
   const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+  if (myGen !== State.loadGeneration) return; // устарело — за это время открыли другое фото
   State.fullBitmap = bitmap;
   renderPropertiesPanel(item, file, bitmap);
 
+  // цветовой вариант — тоже часть "чистого" состояния только что открытого файла;
+  // сбрасываем здесь (а не только в selectPhoto), чтобы после saveCurrent() -> loadPhoto()
+  // кнопка "сохранить" не оставалась включённой из-за уже применённого варианта
+  State.colorVariant = COLOR_VARIANTS[1];
+  await rebuildPreviewBitmap();
+  if (myGen !== State.loadGeneration) return; // устарело — за это время открыли другое фото
+  fitPreviewToWindowInstant(); // масштаб под новые размеры превью выставляем сразу, до отрисовки, и без анимации — иначе новое фото на долю секунды деформируется в пропорции старого
+
+  // включённые регулировки (открытый ползунок поворота, рамка обрезки, режим перспективы)
+  // переходят на новое фото как есть — сбрасываются только сами значения (угол, квад,
+  // рамка кропа), завязанные на конкретное изображение, а не то, что регулировка включена
+  State.rotationDeg = 0;
+  el("rotate-slider").value = 0;
+  State.perspectiveQuad = null;
+  if (State.perspectiveMode) {
+    // тот же дефолтный квад — от истинных краёв фото, что и при первом включении режима
+    const w = State.previewW, h = State.previewH;
+    State.perspectiveQuad = [
+      { x: 0, y: 0 },
+      { x: w, y: 0 },
+      { x: w, y: h },
+      { x: 0, y: h },
+    ];
+  }
+  el("perspective-btn").classList.toggle("active", State.perspectiveMode);
+  syncCropFrameUI();
+  State.exifDirty = false;
+  State.netQuarterTurns = 0;
+  State.netFlipped = false;
+  // горизонт автоматически подбирается как стартовая точка для ручной подстройки — но только
+  // если включена кнопка "⚖" и у фото ещё нет сохранённой правки (см. maybeAutoDetectHorizon);
+  // она же делает resetCropRect/refreshDirty/render в любом случае
+  await maybeAutoDetectHorizon(item, myGen);
+}
+
+// пересобирает уменьшенную копию для редактирования (State.previewBitmap/previewW/previewH)
+// из текущего State.fullBitmap — нужно и при открытии фото, и после жёсткого поворота/отражения
+async function rebuildPreviewBitmap() {
+  const bitmap = State.fullBitmap;
   const scale = Math.min(1, PREVIEW_MAX / Math.max(bitmap.width, bitmap.height));
   State.previewW = Math.round(bitmap.width * scale);
   State.previewH = Math.round(bitmap.height * scale);
@@ -532,41 +916,217 @@ async function loadPhoto(item) {
     resizeHeight: State.previewH,
     resizeQuality: "high",
   });
+  refreshDisplayBitmap();
+}
 
+// применяет текущий State.colorVariant к previewBitmap и кладёт результат в State.displayBitmap —
+// именно его рисует render(). Отдельный шаг (не «на лету» в render()), потому что
+// getImageData/putImageData по всему кадру на каждый rAF было бы избыточно дорого во время
+// перетаскивания ползунка поворота, а сам цветовой вариант меняется редко — только по клику
+function refreshDisplayBitmap() {
+  const w = State.previewW, h = State.previewH;
+  if (!State.previewBitmap || !w || !h) {
+    State.displayBitmap = State.previewBitmap;
+    return;
+  }
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  const cctx = c.getContext("2d");
+  cctx.drawImage(State.previewBitmap, 0, 0);
+  if (State.colorVariant.key !== COLOR_VARIANTS[1].key) {
+    const imgData = cctx.getImageData(0, 0, w, h);
+    applyColorTreatment(imgData, {
+      saturationBoost: State.colorVariant.saturationBoost,
+      clipPercent: State.colorVariant.clipPercent,
+      warm: State.colorVariant.warm,
+    });
+    cctx.putImageData(imgData, 0, 0);
+  }
+  State.displayBitmap = c;
+}
+
+// автоматически определяет угол горизонта (OpenCV) и выставляет его как стартовую точку перед
+// ручной подстройкой — сама по себе ничего не решает про то, нужно ли её вызывать (это делает
+// maybeAutoDetectHorizon), только детектирует и применяет
+async function autoDetectHorizon(item) {
+  if (!State.fullBitmap) return;
+  // статус-бар — единственная строка, но пользователю нужно и видеть, какое фото открыто, и
+  // что с ним сделал автогоризонт, поэтому имя файла всегда идёт первым, а результат детекции
+  // дописывается следом, а не заменяет его целиком
+  const namePrefix = item ? item.name + " — " : "";
+  // строим канвас для детекции заново из fullBitmap, а не копируем State.previewBitmap: у
+  // него resizeQuality "high" (нужно для красивого превью), а этот сглаживающий ресемплинг
+  // на реальных фото ощутимо смещает под-пиксельное положение линии горизонта в Canny/Hough
+  // и может увести угол на несколько градусов от истинного
+  const scale = Math.min(1, PREVIEW_MAX / Math.max(State.fullBitmap.width, State.fullBitmap.height));
+  const detectW = Math.round(State.fullBitmap.width * scale);
+  const detectH = Math.round(State.fullBitmap.height * scale);
   const detectCanvas = document.createElement("canvas");
-  detectCanvas.width = State.previewW;
-  detectCanvas.height = State.previewH;
-  detectCanvas.getContext("2d").drawImage(State.previewBitmap, 0, 0);
-  const { horizonAngle, verticals } = detectLines(detectCanvas);
+  detectCanvas.width = detectW;
+  detectCanvas.height = detectH;
+  detectCanvas.getContext("2d").drawImage(State.fullBitmap, 0, 0, detectW, detectH);
+  const { horizonAngle, confident } = detectLines(detectCanvas);
 
-  State.rotationDeg = clamp(round1(horizonAngle), -15, 15);
-  State.verticals = verticals;
-  el("rotate-slider").value = State.rotationDeg;
-  el("rotate-value").textContent = State.rotationDeg.toFixed(1) + "°";
-  if (State.rotationDeg !== 0) State.showGrid = true;
-  el("grid-btn").classList.toggle("active", State.showGrid);
-
-  State.perspectiveMode = false;
-  State.perspectiveQuad = null;
-  el("perspective-btn").classList.remove("active");
+  // явной линии горизонта на фото может не быть вообще — тогда лучше не трогать угол, чем
+  // крутить фото по случайному краю предмета или текстуре (см. detectLines); но рамку кропа и
+  // рендер всё равно надо обновить — это тот же вызов, которым rotateQuarter/flipHorizontal
+  // синхронизируют её с новыми (после жёсткого поворота/зеркала) размерами превью
+  if (confident && Math.abs(horizonAngle) > AUTO_HORIZON_MAX_ANGLE) {
+    // настоящий горизонт редко бывает завален больше чем на несколько градусов — такой большой
+    // угол значит, что за горизонт приняли что-то другое (край предмета, диагональ переднего
+    // плана), и лучше пропустить это как ошибку детектора, чем радикально повернуть фото
+    setStatus("status-bar", `${namePrefix}Похоже, за горизонт приняли что-то другое (угол ${round1(horizonAngle)}° — это больше ${AUTO_HORIZON_MAX_ANGLE}°), угол не менял.`);
+  } else if (confident) {
+    // detectLines считает угол в координатах изображения (y вниз): положительный angle —
+    // горизонт опускается вправо. ctx.rotate с тем же знаком крутит картинку ПО часовой —
+    // то есть ещё сильнее опускает правый край. Чтобы выровнять, крутить нужно в обратную
+    // сторону, отсюда минус.
+    State.rotationDeg = clamp(round1(-horizonAngle), -90, 90);
+    el("rotate-slider").value = State.rotationDeg;
+    // явно подтверждаем, что и почему применили — иначе сообщение об ошибке с предыдущего
+    // фото (не нашли горизонт / угол слишком большой) повиснет в статус-баре и будет
+    // противоречить реально применённому углу
+    setStatus("status-bar", `${namePrefix}Горизонт выровнен автоматически (угол ${State.rotationDeg}°).`);
+    if (State.rotationDeg !== 0) {
+      State.showGrid = true;
+      // как и при ручной подстройке — ненулевой угол даёт чёрные уголки по краям, рамку
+      // обрезки нужно показать сразу, а не полагаться, что пользователь вспомнит нажать её сам
+      showCropFrame();
+    }
+    el("grid-btn").classList.toggle("active", State.showGrid);
+  } else {
+    setStatus("status-bar", `${namePrefix}Не нашёл явной линии горизонта — угол не менял.`);
+  }
 
   resetCropRect();
-  State.dirty = false;
+  // угол горизонта уже подобран автоматически — это реальная правка, а не нейтральный старт,
+  // поэтому при ненулевом угле сразу считаем фото несохранённым (спросит перед уходом с фото)
+  refreshDirty();
   render();
+}
+
+// решает, нужно ли вообще запускать автогоризонт, и либо делает это, либо просто синхронизирует
+// рамку кропа/рендер (тот минимум, что иначе делала бы сама autoDetectHorizon в конце) — общая
+// точка входа для loadPhoto/rotateQuarter/flipHorizontal и для клика по кнопке "⚖". myGen — номер
+// поколения (State.loadGeneration на момент старта вызывающей функции, до её await'ов); если за
+// это время (пока читался файл/пересобиралось превью) успела начаться более новая операция —
+// эта уже устарела и не должна ничего применять/рендерить поверх неё
+async function maybeAutoDetectHorizon(item, myGen) {
+  if (myGen !== State.loadGeneration) return;
+  // кнопка выключена — автогоризонт вообще не трогаем; но сообщение об ошибке детектора
+  // с предыдущего фото (если было) относится уже не к этому фото — заменяем на имя текущего,
+  // иначе оно повиснет и будет путать
+  if (!State.autoHorizonEnabled) {
+    setStatus("status-bar", item ? item.name : "");
+    resetCropRect();
+    refreshDirty();
+    render();
+    return;
+  }
+  // у фото уже есть сохранённая правка (был бэкап оригинала) — значит угол/кадр уже когда-то
+  // подобрали руками и сохранили; автогоризонт не должен переигрывать это заново при каждом
+  // открытии, иначе намеренно оставленный "неровный" горизонт будет постоянно сбрасываться
+  if (item && item.edited) {
+    setStatus("status-bar", item.name);
+    resetCropRect();
+    refreshDirty();
+    render();
+    return;
+  }
+  await autoDetectHorizon(item);
+}
+
+function toggleAutoHorizon() {
+  State.autoHorizonEnabled = !State.autoHorizonEnabled;
+  localStorage.setItem(AUTO_HORIZON_STORAGE_KEY, State.autoHorizonEnabled ? "1" : "0");
+  el("auto-horizon-btn").classList.toggle("active", State.autoHorizonEnabled);
+  // включили — сразу применяем к уже открытому фото, а не только при следующем открытии
+  if (State.autoHorizonEnabled && State.index >= 0) {
+    const myGen = ++State.loadGeneration;
+    maybeAutoDetectHorizon(State.queue[State.index], myGen);
+  }
+}
+
+// жёсткий поворот на 90°: quarterTurns 1 = по часовой, -1 = против часовой — впечатывается
+// прямо в пиксели (в отличие от State.rotationDeg — это точная подстройка угла горизонта)
+async function rotateQuarter(quarterTurns) {
+  if (!State.fullBitmap) return;
+  // отдельное "поколение" операции — как в loadPhoto, чтобы более новое действие (например,
+  // быстрый переход к другому фото) не дало этому, более старому и медленному вызову, переписать
+  // состояние своими устаревшими результатами после того, как оно уже применит свои
+  const myGen = ++State.loadGeneration;
+  State.fullBitmap = await createImageBitmap(rotateBitmapQuarter(State.fullBitmap, quarterTurns));
+  await rebuildPreviewBitmap();
+  if (myGen !== State.loadGeneration) return;
+  // на 90°/270° ширина и высота превью меняются местами — CSS-размер canvas (задан в px,
+  // см. setPreviewZoom) остаётся от старой, уже неверной пропорции, пока explicitly не
+  // пересчитать его под новые previewW/previewH; иначе браузер растягивает новый кадр
+  // в старую рамку
+  fitPreviewToWindowInstant();
+  // жёсткий поворот сам по себе обратим — если по сумме поворотов фото вернулось в исходную
+  // ориентацию (например, 4×90° или 90° затем -90°), пиксели идентичны оригиналу, и запрос
+  // на сохранение показывать не за что; поэтому считаем не "тронули — значит грязно", а
+  // накопленный поворот по модулю 4
+  State.netQuarterTurns = ((State.netQuarterTurns + quarterTurns) % 4 + 4) % 4;
+  // старый угол был подобран под прежнюю ориентацию пикселей и для новой уже бессмыслен;
+  // без сброса он застревал бы от прошлой ориентации, если для новой автогоризонт не
+  // уверен и оставит угол как есть — тогда даже вернувшись полным кругом к исходной
+  // ориентации, фото так и осталось бы помеченным изменённым
+  State.rotationDeg = 0;
+  el("rotate-slider").value = 0;
+  showCropFrame();
+  // ориентация сменилась — угол горизонта для неё подбираем заново, как при открытии фото
+  await maybeAutoDetectHorizon(State.queue[State.index], myGen);
+}
+
+async function flipHorizontal() {
+  if (!State.fullBitmap) return;
+  const myGen = ++State.loadGeneration;
+  State.fullBitmap = await createImageBitmap(flipBitmapHorizontal(State.fullBitmap));
+  await rebuildPreviewBitmap();
+  if (myGen !== State.loadGeneration) return;
+  // как и с поворотом — два разворота подряд возвращают исходные пиксели, поэтому
+  // отслеживаем чётность, а не выставляем "грязно" безусловно
+  State.netFlipped = !State.netFlipped;
+  // тот же резон, что и в rotateQuarter — старый угол относился к зеркально другой картинке
+  State.rotationDeg = 0;
+  el("rotate-slider").value = 0;
+  showCropFrame();
+  await maybeAutoDetectHorizon(State.queue[State.index], myGen);
 }
 
 async function renderPropertiesPanel(item, file, bitmap) {
   const list = el("properties-list");
   list.innerHTML = "";
 
-  const addRow = (label, value) => {
-    if (!value) return;
+  const addRow = (label, { noCopy = false } = {}) => {
     const dt = document.createElement("dt");
     dt.textContent = label;
     const dd = document.createElement("dd");
-    dd.textContent = value;
     list.appendChild(dt);
     list.appendChild(dd);
+
+    if (noCopy) return { dd, copyBtn: null };
+    // кнопка копирования — оверлей внутри самого значения (с прозрачным фоном), а не
+    // отдельная колонка сетки, чтобы короткие значения не оставляли пустую полосу у края
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "properties-copy-btn";
+    copyBtn.title = "Скопировать";
+    copyBtn.innerHTML = '<img src="icons/Copy WIT.png" alt="">';
+    copyBtn.style.visibility = State.copyMode ? "visible" : "hidden";
+    return { dd, copyBtn };
+  };
+
+  const addStaticRow = (label, value, opts) => {
+    const { dd, copyBtn } = addRow(label, opts);
+    dd.textContent = value || "—";
+    dd.classList.toggle("empty", !value);
+    if (copyBtn) {
+      dd.appendChild(copyBtn); // добавляем после текста, чтобы textContent выше его не стёр
+      copyBtn.disabled = !value;
+      copyBtn.addEventListener("click", () => copyToClipboard(value, copyBtn));
+    }
   };
 
   let exif = null;
@@ -576,23 +1136,247 @@ async function renderPropertiesPanel(item, file, bitmap) {
     // повреждённый/нестандартный EXIF — просто не показываем эти поля
   }
 
-  addRow("Файл", item.name);
-  addRow("Размер", formatFileSize(file.size));
-  addRow("Разрешение", `${bitmap.width} × ${bitmap.height}`);
-  addRow("Дата съёмки", formatExifDate(exif && exif.dateTaken) || formatFileDate(file.lastModified));
-  addRow("Камера", [exif && exif.make, exif && exif.model].filter(Boolean).join(" "));
+  addStaticRow("Файл", item.name);
+  addStaticRow("Размер", formatFileSize(file.size), { noCopy: true });
+  addStaticRow("Разрешение", `${bitmap.width} × ${bitmap.height}`, { noCopy: true });
 
-  const mapWrap = el("properties-map");
-  const mapFrame = el("properties-map-frame");
-  if (exif && exif.lat != null && exif.lon != null) {
-    const d = 0.01;
-    const bbox = [exif.lon - d, exif.lat - d, exif.lon + d, exif.lat + d].join("%2C");
-    mapFrame.src = `https://www.openstreetmap.org/export/embed.html?bbox=${bbox}&marker=${exif.lat}%2C${exif.lon}`;
-    mapWrap.hidden = false;
-  } else {
-    mapFrame.src = "";
-    mapWrap.hidden = true;
+  // сохраняем для восстановления в файл при экспорте — canvas.toBlob() стирает весь EXIF;
+  // {} ведёт себя как null для injectExif, пока пользователь ничего не поправил вручную
+  State.currentExif = exif || {};
+
+  // Дата съёмки — единое поле datetime-local: его нативный попап уже показывает
+  // и календарь, и время; title подсказывает порядок ч/мин/с внутри поля
+  {
+    const { dd, copyBtn } = addRow("Дата съёмки");
+    const input = document.createElement("input");
+    input.type = "datetime-local";
+    input.step = "1";
+    input.title = "чч:мм:сс — часы : минуты : секунды";
+    input.className = "properties-edit-input";
+    input.disabled = !State.copyMode;
+
+    const parts = splitExifDate(exif && exif.dateTaken) || splitExifDate(fileDateToExifDate(file.lastModified));
+    input.value = `${parts.y}-${parts.mo}-${parts.d}T${parts.h}:${parts.mi}:${parts.se}`;
+    dd.appendChild(input);
+    dd.appendChild(copyBtn);
+
+    // нативный значок календаря спрятан (наезжал на кнопку копирования) — открываем
+    // тот же попап по двойному клику на поле
+    input.addEventListener("dblclick", () => {
+      if (!input.disabled && input.showPicker) input.showPicker();
+    });
+
+    const readExifDate = () => {
+      const m = input.value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+      if (!m) return null;
+      const [, y, mo, d, h, mi, se] = m;
+      return buildExifDate(y, mo, d, h, mi, se || "0");
+    };
+
+    copyBtn.addEventListener("click", () => {
+      copyToClipboard(formatExifDate(readExifDate()) || "", copyBtn);
+    });
+
+    input.addEventListener("change", () => {
+      const exifValue = readExifDate();
+      if (exifValue) {
+        State.currentExif.dateTaken = exifValue;
+        State.exifDirty = true;
+        refreshDirty();
+      }
+    });
   }
+
+  // Камера — свободный текст, можно вставить (Ctrl+V) поверх в режиме редактирования
+  {
+    const { dd, copyBtn } = addRow("Камера");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "properties-edit-input";
+    input.disabled = !State.copyMode;
+    input.value = [exif && exif.make, exif && exif.model].filter(Boolean).join(" ");
+    dd.appendChild(input);
+    dd.appendChild(copyBtn);
+    copyBtn.disabled = !input.value;
+    copyBtn.addEventListener("click", () => copyToClipboard(input.value, copyBtn));
+    input.addEventListener("input", () => {
+      copyBtn.disabled = !input.value;
+      State.currentExif.make = input.value;
+      State.currentExif.model = "";
+      State.exifDirty = true;
+      refreshDirty();
+    });
+  }
+
+  // GPS — координаты не набираются руками, а проставляются кликом по карте (см. setCurrentGeo)
+  {
+    const { dd, copyBtn } = addRow("GPS");
+    const span = document.createElement("span");
+    dd.appendChild(span);
+    dd.appendChild(copyBtn);
+    State.updateGpsRow = (lat, lon) => {
+      const has = lat != null && lon != null;
+      span.textContent = has ? `${lat.toFixed(6)}, ${lon.toFixed(6)}` : "—";
+      dd.classList.toggle("empty", !has);
+      copyBtn.disabled = !has;
+    };
+    copyBtn.addEventListener("click", () => copyToClipboard(span.textContent, copyBtn));
+    State.updateGpsRow(exif && exif.lat, exif && exif.lon);
+  }
+
+  // карту можно открыть и без GPS — чтобы проставить координаты кликом впервые
+  // (актуально для сканов плёнок, у которых EXIF изначально пустой)
+  setMapButtonsEnabled(true);
+
+  if (exif && exif.lat != null && exif.lon != null) {
+    State.currentGeo = { lat: exif.lat, lon: exif.lon };
+  } else {
+    State.currentGeo = null;
+  }
+  // читаем EXIF этого фото уже здесь — не ждём фоновый collectAlbumGeo, у него может
+  // быть устаревшее значение, если координаты только что изменили и ещё не сохранили
+  if (State.index >= 0 && State.index < State.albumGeo.length) State.albumGeo[State.index] = State.currentGeo;
+  refreshMaps();
+}
+
+// формат EXIF-даты: "YYYY:MM:DD HH:MM:SS"
+function fileDateToExifDate(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}:${pad(d.getMonth() + 1)}:${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function splitExifDate(s) {
+  const m = s && s.match(/^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, se] = m;
+  return { y, mo, d, h, mi, se };
+}
+
+function buildExifDate(y, mo, d, h, mi, se) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${y}:${pad(mo)}:${pad(d)} ${pad(h)}:${pad(mi)}:${pad(se)}`;
+}
+
+// краткая вспышка кнопки — единственная обратная связь при копирании в буфер
+function copyToClipboard(text, btn) {
+  navigator.clipboard
+    .writeText(text)
+    .then(() => {
+      btn.classList.add("copy-flash");
+      setTimeout(() => btn.classList.remove("copy-flash"), 350);
+    })
+    .catch(() => {});
+}
+
+// координаты берутся кликом по встроенной или внешней карте, а не набором вручную
+function setCurrentGeo(lat, lon) {
+  State.currentGeo = { lat, lon };
+  if (State.index >= 0) State.albumGeo[State.index] = { lat, lon };
+  if (!State.currentExif) State.currentExif = {};
+  State.currentExif.lat = lat;
+  State.currentExif.lon = lon;
+  State.exifDirty = true;
+  refreshDirty();
+  if (State.updateGpsRow) State.updateGpsRow(lat, lon);
+  refreshMaps();
+}
+
+// кнопки карты никогда не скрываются — только блокируются, когда у фото нет геоданных
+function setMapButtonsEnabled(enabled) {
+  el("properties-map-btn").disabled = !enabled;
+  el("properties-map-new-btn").disabled = !enabled;
+}
+
+// единая точка обновления обеих карт — встроенной и всплывающего окна — так они всегда
+// показывают один и тот же набор меток всего альбома и одинаково подсвечивают текущее фото
+function refreshMaps() {
+  if (State.mapWindow && !State.mapWindow.closed) {
+    State.mapWindow.postMessage({ points: State.albumGeo, activeIndex: State.index, copyMode: State.copyMode }, "*");
+  }
+  const embedWrap = el("properties-map-embed");
+  if (embedWrap && !embedWrap.hidden) refreshEmbeddedMapMarkers();
+}
+
+// встроенная карта в панели параметров — своя интерактивная Leaflet-карта (не iframe с
+// openstreetmap.org), потому что клики внутри чужого iframe браузер не отдаёт скрипту
+// из-за cross-origin — без этого нельзя было бы проставлять GPS кликом
+let embeddedMap = null;
+const embeddedMarkersRef = { list: [] }; // все капли альбома на встроенной карте (см. geo-markers.js)
+
+function ensureEmbeddedMap() {
+  if (embeddedMap) return embeddedMap;
+  embeddedMap = L.map("properties-map-embed-frame", { attributionControl: true, zoomControl: false });
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "© OpenStreetMap",
+  }).addTo(embeddedMap);
+  // вид должен существовать ДО того как на карту попадут метки — без него Leaflet
+  // добавляет их с временным pixelOrigin и они остаются смещены на тысячи пикселей
+  // за пределы видимой области, даже когда на первый взгляд карта выглядит нормально
+  embeddedMap.setView([20, 0], 2);
+  embeddedMap.on("click", (e) => {
+    if (!State.copyMode) return; // ставим точку только в режиме редактирования
+    setCurrentGeo(e.latlng.lat, e.latlng.lng);
+  });
+  return embeddedMap;
+}
+
+// расставляет капли всего альбома и подводит вид карты к текущему фото (или ко всем
+// известным точкам, если у текущего фото геоданных нет)
+function refreshEmbeddedMapMarkers() {
+  const map = ensureEmbeddedMap();
+  // вид выставляем до расстановки меток (см. комментарий в ensureEmbeddedMap) —
+  // иначе новые капли ложатся с неверным смещением
+  const cur = State.index >= 0 ? State.albumGeo[State.index] : null;
+  if (cur) {
+    map.setView([cur.lat, cur.lon], 16);
+  } else if (State.albumGeo.some(Boolean)) {
+    map.fitBounds(L.latLngBounds(State.albumGeo.filter(Boolean).map((g) => [g.lat, g.lon])).pad(0.2));
+  } else {
+    map.setView([20, 0], 2);
+  }
+  // клик по капле переводит фокус на первое фото в группе; в режиме редактирования GPS
+  // важнее не мешать простановке точки, поэтому клики по каплям там не перехватываем
+  syncGeoMarkers(L, map, embeddedMarkersRef, State.albumGeo, State.index, State.copyMode ? null : (indexes) => goToPhoto(pickClusterTarget(indexes, State.index)));
+  requestAnimationFrame(() => map.invalidateSize());
+}
+
+function toggleEmbeddedMap() {
+  const wrap = el("properties-map-embed");
+  if (!wrap.hidden) {
+    wrap.hidden = true;
+    el("properties-map-btn").classList.remove("active");
+    return;
+  }
+  wrap.hidden = false;
+  el("properties-map-btn").classList.add("active");
+  refreshEmbeddedMapMarkers();
+}
+
+let mapWindowWatcher = null; // следит за окном карты, чтобы погасить кнопку, если его закрыли крестиком, а не повторным кликом
+
+function toggleLocationMapWindow() {
+  if (State.mapWindow && !State.mapWindow.closed) {
+    State.mapWindow.close();
+    onMapWindowClosed();
+    return;
+  }
+  // без query-параметров — окно само сообщит о готовности ("map-ready"), и мы пришлём
+  // ему актуальные точки; так у обеих карт ровно один источник данных и код отрисовки
+  State.mapWindow = window.open("map.html", "albom_map");
+  el("properties-map-new-btn").classList.add("active");
+  clearInterval(mapWindowWatcher);
+  mapWindowWatcher = setInterval(() => {
+    if (!State.mapWindow || State.mapWindow.closed) onMapWindowClosed();
+  }, 500);
+}
+
+function onMapWindowClosed() {
+  clearInterval(mapWindowWatcher);
+  mapWindowWatcher = null;
+  State.mapWindow = null;
+  el("properties-map-new-btn").classList.remove("active");
 }
 
 function formatFileSize(bytes) {
@@ -610,20 +1394,70 @@ function formatExifDate(s) {
   return `${d}.${mo}.${y} ${h}:${mi}`;
 }
 
-function formatFileDate(ms) {
-  const d = new Date(ms);
-  return d.toLocaleDateString("ru-RU") + " " + d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
-}
-
 function clearPropertiesPanel() {
   el("properties-list").innerHTML = "";
-  el("properties-map-frame").src = "";
-  el("properties-map").hidden = true;
+  State.currentGeo = null;
+  State.currentExif = null;
+  State.updateGpsRow = null;
+  State.copyMode = false; // без фото редактировать нечего — карандаш гаснет вместе с панелью
+  setMapButtonsEnabled(false);
+  el("properties-map-embed").hidden = true;
+  embeddedMarkersRef.list.forEach((m) => m.remove());
+  embeddedMarkersRef.list = [];
 }
 
 function resetCropRect() {
-  // размеры именно новой картинки, а не то что осталось на canvas от предыдущего кадра
-  State.cropRect = rectForAspect(State.previewW, State.previewH, State.aspect.w, State.aspect.h);
+  // размеры именно новой картинки, а не то что осталось на canvas от предыдущего кадра;
+  // учитываем и поворот, и (если активна) коррекцию перспективы — рамка вписывается в
+  // истинно видимую область фото, а не только в её повёрнутый вариант, иначе сразу залезает
+  // в пустые (прозрачные/чёрные) зоны, оставленные любым из этих двух искажений
+  const quad = photoVisibleQuad(State.previewW, State.previewH, State.rotationDeg, State.perspectiveQuad);
+  State.cropRect = rectForAspectInQuad(quad, State.aspect.w, State.aspect.h);
+}
+
+function cropIsAtDefault() {
+  const quad = photoVisibleQuad(State.previewW, State.previewH, State.rotationDeg, State.perspectiveQuad);
+  const base = rectForAspectInQuad(quad, State.aspect.w, State.aspect.h);
+  const r = State.cropRect;
+  const eps = 0.5;
+  return Math.abs(r.x - base.x) < eps && Math.abs(r.y - base.y) < eps
+    && Math.abs(r.w - base.w) < eps && Math.abs(r.h - base.h) < eps;
+}
+
+// режим перспективы сам по себе (кнопка включена) — это ещё не правка: реальная правка
+// появляется только когда хотя бы один угол реально сдвинут от истинных краёв фото
+function perspectiveIsAtDefault() {
+  const q = State.perspectiveQuad;
+  if (!q) return true;
+  const w = State.previewW, h = State.previewH;
+  const base = [{ x: 0, y: 0 }, { x: w, y: 0 }, { x: w, y: h }, { x: 0, y: h }];
+  const eps = 0.5;
+  return q.every((p, i) => Math.abs(p.x - base[i].x) < eps && Math.abs(p.y - base[i].y) < eps);
+}
+
+// пересчитывает флаг "есть несохранённые правки" из фактического состояния, а не из факта
+// "было какое-то взаимодействие" — иначе, вернув угол/рамку обратно в исходное положение,
+// пользователь всё равно получал бы лишний вопрос "сохранить?" при уходе с фото
+function refreshDirty() {
+  // строгое сравнение с 0 ломалось из-за того, что ползунок (step 0.1) при перетаскивании
+  // мышью может дать не ровно 0, а что-то вроде 0.09999999999999964 — визуально те же "0.0°",
+  // но dirty никогда не сбрасывался; берём с допуском, как и для рамки кропа
+  // нейтральны оба конца шкалы цветокоррекции: "Авто" — стартовый вариант по умолчанию для
+  // любого свежеоткрытого фото, а "Оригинал" — явный отказ от какой-либо обработки, то есть
+  // тот же необработанный файл, что и так лежит на диске; правкой считается только выбор
+  // конкретного цветового пресета (контраст/ч-б/тепло)
+  const colorIsNeutral = State.colorVariant.key === COLOR_VARIANTS[0].key
+    || State.colorVariant.key === COLOR_VARIANTS[1].key;
+  const visuallyNeutral = Math.abs(State.rotationDeg) < 0.05
+    && perspectiveIsAtDefault()
+    && colorIsNeutral
+    && cropIsAtDefault()
+    && State.netQuarterTurns === 0
+    && !State.netFlipped;
+  State.dirty = State.exifDirty || !visuallyNeutral;
+  // кнопка "сохранить" должна отражать именно этот пересчитанный dirty, а не просто
+  // "фото открыто" — иначе она горит даже при простом просмотре без правок
+  el("save-btn").disabled = !State.dirty;
 }
 
 // подстраховка: рамка кадрирования никогда не должна вылезать за пределы канваса —
@@ -635,50 +1469,179 @@ function clampCropRectToCanvas(r, w, h) {
   r.y = clamp(r.y, 0, h - r.h);
 }
 
-function rotatePoint(x, y, cx, cy, angleDeg) {
+// настоящая видимая (непрозрачная) граница фото на экране — учитывает ОБА фактора,
+// способных нарушить целостность прямоугольника: поворот (чёрные уголки) и коррекцию
+// перспективы (деформация всей картинки в произвольный четырёхугольник). Сначала строим
+// угол повёрнутого (но ещё не деформированного перспективой) прямоугольника — как и раньше,
+// это просто поворот вокруг центра канваса; если перспектива активна и реально отличается
+// от исходной формы — дополнительно прогоняем эти же 4 точки через ту же гомографию, что и
+// сам рендер (renderWarpedPerspective/mapUnitSquareToQuad), поскольку варп применяется именно
+// к уже повёрнутой картинке. Результат — выпуклый четырёхугольник, за пределы которого рамка
+// обрезки не должна выходить ни при каких сочетаниях этих двух факторов
+function photoVisibleQuad(w, h, angleDeg, perspectiveQuad) {
+  const cx = w / 2, cy = h / 2;
   const rad = (angleDeg * Math.PI) / 180;
-  const cos = Math.cos(rad), sin = Math.sin(rad);
-  const dx = x - cx, dy = y - cy;
-  return { x: cx + dx * cos - dy * sin, y: cy + dx * sin + dy * cos };
+  const c = Math.cos(rad), s = Math.sin(rad);
+  const rotCorner = (sx, sy) => ({
+    x: cx + ((sx * w) / 2) * c - ((sy * h) / 2) * s,
+    y: cy + ((sx * w) / 2) * s + ((sy * h) / 2) * c,
+  });
+  const rotatedRect = [rotCorner(-1, -1), rotCorner(1, -1), rotCorner(1, 1), rotCorner(-1, 1)];
+  if (!perspectiveQuad || perspectiveIsAtDefault()) return rotatedRect;
+  const mapUV = mapUnitSquareToQuad(perspectiveQuad);
+  return rotatedRect.map((p) => mapUV(p.x / w, p.y / h));
+}
+
+// для выпуклого четырёхугольника quad возвращает его 4 ребра с единым (согласованным)
+// направлением обхода — знак sign подобран так, что "cross(e, P-v)*sign >= 0" верно для
+// ЛЮБОЙ точки P внутри quad, независимо от того, в какую сторону (по часовой/против) заданы
+// исходные вершины
+function quadEdges(quad) {
+  const cx = (quad[0].x + quad[1].x + quad[2].x + quad[3].x) / 4;
+  const cy = (quad[0].y + quad[1].y + quad[2].y + quad[3].y) / 4;
+  return quad.map((v, i) => {
+    const v2 = quad[(i + 1) % 4];
+    const e = { x: v2.x - v.x, y: v2.y - v.y };
+    const cross = e.x * (cy - v.y) - e.y * (cx - v.x);
+    return { v, e, sign: cross >= 0 ? 1 : -1 };
+  });
+}
+
+// клэмпит точку внутрь пересечения полуплоскостей (по одной на каждое условие
+// { ex, ey, vx, vy, sign, margin }, где условие "внутри" — это
+// (ex*(y-vy) - ey*(x-vx))*sign + margin >= 0) — несколько проходов проекции точки на
+// каждое нарушенное условие по очереди (стандартный POCS), для выпуклого пересечения всего
+// 3-4 полуплоскостей нескольких проходов достаточно для визуально точной сходимости
+function clampPointToHalfplanes(x, y, constraints) {
+  for (let pass = 0; pass < 8; pass++) {
+    let violated = false;
+    for (const cst of constraints) {
+      const g = (cst.ex * (y - cst.vy) - cst.ey * (x - cst.vx)) * cst.sign + cst.margin;
+      if (g < 0) {
+        violated = true;
+        const gx = -cst.ey * cst.sign, gy = cst.ex * cst.sign;
+        const gradLenSq = gx * gx + gy * gy;
+        if (gradLenSq > 1e-9) {
+          const t = -g / gradLenSq;
+          x += t * gx;
+          y += t * gy;
+        }
+      }
+    }
+    if (!violated) break;
+  }
+  return { x, y };
+}
+
+// допустимое положение рамки заданного размера (rw x rh) при переносе внутри произвольного
+// выпуклого четырёхугольника quad (видимой границы фото — см. photoVisibleQuad). Рамка
+// остаётся осе-выровненной на экране, но все её 4 угла должны оставаться внутри quad; для
+// каждого ребра quad "самый выступающий" угол рамки (в направлении наружу этого ребра)
+// определяет, насколько нужно поджать ребро внутрь — получаем полуплоскости уже
+// непосредственно для положения (x,y) рамки, а не для её углов
+function clampMoveToQuad(x, y, rw, rh, quad) {
+  const corners = [{ x: 0, y: 0 }, { x: rw, y: 0 }, { x: 0, y: rh }, { x: rw, y: rh }];
+  const constraints = quadEdges(quad).map(({ v, e, sign }) => {
+    let margin = Infinity;
+    for (const o of corners) {
+      const val = (e.x * o.y - e.y * o.x) * sign;
+      if (val < margin) margin = val;
+    }
+    return { ex: e.x, ey: e.y, vx: v.x, vy: v.y, sign, margin };
+  });
+  return clampPointToHalfplanes(x, y, constraints);
+}
+
+// та же идея для растягивания за угол: анкорный (противоположный) угол рамки неподвижен
+// (и уже лежит внутри quad), размер растёт от него к курсору — для каждого ребра quad и
+// каждого из 3 движущихся углов рамки условие "остаться внутри" линейно по доле роста t,
+// берём наименьшую допустимую t по всем этим условиям сразу
+function clampResizeToQuad(anchor, rawW, rawH, signX, signY, quad) {
+  if (rawW <= 0 || rawH <= 0) return { w: rawW, h: rawH };
+  const movingCorners = [{ i: 1, j: 0 }, { i: 0, j: 1 }, { i: 1, j: 1 }];
+  let maxT = 1;
+  for (const { v, e, sign } of quadEdges(quad)) {
+    const gAnchor = (e.x * (anchor.y - v.y) - e.y * (anchor.x - v.x)) * sign;
+    for (const { i, j } of movingCorners) {
+      const dx = i * signX * rawW, dy = j * signY * rawH;
+      const slope = (e.x * dy - e.y * dx) * sign;
+      if (slope < 0) maxT = Math.min(maxT, gAnchor / -slope);
+    }
+  }
+  maxT = clamp(maxT, 0, 1);
+  return { w: rawW * maxT, h: rawH * maxT };
+}
+
+// вписывает по центру наибольший прямоугольник заданного соотношения сторон в произвольный
+// выпуклый quad (видимую границу фото — см. photoVisibleQuad) — обобщение imaging.js'ного
+// rectForAspect (там центр совпадает с центром повёрнутого прямоугольника и есть готовая
+// тригонометрическая формула; здесь центр — центроид quad, а масштаб ищется тем же приёмом,
+// что и в clampResizeToQuad: углы прямоугольника линейны по коэффициенту роста s от центра,
+// поэтому каждое ребро quad даёт прямое, без итераций, условие на максимальное s)
+function rectForAspectInQuad(quad, aspectW, aspectH) {
+  const ratio = aspectW / aspectH;
+  const cx = (quad[0].x + quad[1].x + quad[2].x + quad[3].x) / 4;
+  const cy = (quad[0].y + quad[1].y + quad[2].y + quad[3].y) / 4;
+  const offsets = [
+    { x: ratio, y: -1 }, { x: -ratio, y: -1 },
+    { x: ratio, y: 1 }, { x: -ratio, y: 1 },
+  ];
+  let maxS = Infinity;
+  for (const { v, e, sign } of quadEdges(quad)) {
+    const gCenter = (e.x * (cy - v.y) - e.y * (cx - v.x)) * sign;
+    for (const o of offsets) {
+      const slope = (e.x * o.y - e.y * o.x) * sign;
+      if (slope < 0) maxS = Math.min(maxS, gCenter / -slope);
+    }
+  }
+  maxS = Math.max(0, maxS);
+  const h = 2 * maxS;
+  const w = h * ratio;
+  return { x: cx - w / 2, y: cy - h / 2, w, h };
+}
+
+// схлопывает частые вызовы (например, при перетаскивании ползунка поворота) в один
+// перерисовку за кадр — иначе при быстром вводе canvas не успевает за событиями и "дёргается"
+let renderRafId = null;
+function requestRender() {
+  if (renderRafId !== null) return;
+  renderRafId = requestAnimationFrame(() => {
+    renderRafId = null;
+    render();
+  });
 }
 
 function render() {
   const c = canvas();
   const cctx = ctx();
   const w = State.previewW, h = State.previewH;
-  c.width = w;
-  c.height = h;
+
+  // canvas держим строго по размеру фото — менять его размер на каждый кадр (например, под
+  // отступ для ручек) дорого: это вызывает синхронный layout-reflow и на быстрых событиях
+  // (перетаскивание ползунка поворота) заметно подтормаживает сам слайдер.
+  // Вместо этого ручки рисуются с отступом внутрь (см. renderCropFrame/renderPerspectiveFrame).
+  if (c.width !== w) c.width = w;
+  if (c.height !== h) c.height = h;
+  const scale = canvasScale();
+
+  el("rotate-value").textContent = State.rotationDeg.toFixed(1) + "°";
 
   cctx.fillStyle = "#000";
   cctx.fillRect(0, 0, w, h);
-  drawRotated(cctx, State.previewBitmap, State.rotationDeg);
 
-  if (State.perspectiveMode) {
-    renderPerspectiveDarken(cctx, w, h);
+  const baseBitmap = State.displayBitmap || State.previewBitmap;
+  if (State.perspectiveMode && State.perspectiveQuad && !perspectiveIsAtDefault()) {
+    renderWarpedPerspective(cctx, baseBitmap, w, h);
   } else {
-    renderCropDarken(cctx, w, h);
+    drawRotatedAt(cctx, baseBitmap, State.rotationDeg, 0, 0);
   }
 
-  // направляющие вертикали (перенесены в координаты повёрнутого фото)
-  cctx.strokeStyle = "rgba(255,210,80,0.7)";
-  cctx.lineWidth = 1.5;
-  const cx = w / 2, cy = h / 2;
-  for (const v of State.verticals) {
-    const p1 = rotatePoint(v.x1, v.y1, cx, cy, State.rotationDeg);
-    const p2 = rotatePoint(v.x2, v.y2, cx, cy, State.rotationDeg);
-    cctx.beginPath();
-    cctx.moveTo(p1.x, p1.y);
-    cctx.lineTo(p2.x, p2.y);
-    cctx.stroke();
-  }
+  if (State.cropVisible) renderCropDarken(cctx, w, h);
 
   if (State.showGrid) renderGrid(cctx, w, h);
 
-  if (State.perspectiveMode) {
-    renderPerspectiveFrame(cctx);
-  } else {
-    renderCropFrame(cctx);
-  }
+  if (State.cropVisible) renderCropFrame(cctx, scale, w, h);
+  if (State.perspectiveMode) renderPerspectiveFrame(cctx, scale, w, h);
 }
 
 function renderCropDarken(cctx, w, h) {
@@ -690,7 +1653,7 @@ function renderCropDarken(cctx, w, h) {
   cctx.fillRect(r.x + r.w, r.y, w - r.x - r.w, r.h);
 }
 
-function renderCropFrame(cctx) {
+function renderCropFrame(cctx, scale, w, h) {
   const r = State.cropRect;
   cctx.strokeStyle = "#4da3ff";
   cctx.lineWidth = 2;
@@ -699,31 +1662,49 @@ function renderCropFrame(cctx) {
   // угловые ручки — размер в единицах канваса, но зависит от масштаба показа,
   // чтобы визуально оставаться постоянного размера на экране
   cctx.fillStyle = "#4da3ff";
-  const handleVisualR = HANDLE_VISUAL_CSS * canvasScale();
+  const handleVisualR = HANDLE_VISUAL_CSS * scale;
   for (const [hx, hy] of cornerPoints(r)) {
+    const [cxp, cyp] = insetIntoCanvas(hx, hy, handleVisualR, w, h);
     cctx.beginPath();
-    cctx.arc(hx, hy, handleVisualR, 0, Math.PI * 2);
+    cctx.arc(cxp, cyp, handleVisualR, 0, Math.PI * 2);
     cctx.fill();
   }
 }
 
-function renderPerspectiveDarken(cctx, w, h) {
-  const q = State.perspectiveQuad;
-  if (!q) return;
-  cctx.save();
-  cctx.fillStyle = "rgba(0,0,0,0.55)";
-  cctx.beginPath();
-  cctx.rect(0, 0, w, h);
-  cctx.moveTo(q[0].x, q[0].y);
-  cctx.lineTo(q[1].x, q[1].y);
-  cctx.lineTo(q[2].x, q[2].y);
-  cctx.lineTo(q[3].x, q[3].y);
-  cctx.closePath();
-  cctx.fill("evenodd");
-  cctx.restore();
+// не даёт кругу ручки вылезти за пределы canvas и срезаться его краем —
+// центр чуть подвигаем внутрь, сам круг при этом рисуется целиком
+function insetIntoCanvas(x, y, r, w, h) {
+  return [clamp(x, r, w - r), clamp(y, r, h - r)];
 }
 
-function renderPerspectiveFrame(cctx) {
+// угол перспективы можно утянуть далеко за пределы фото — если рисовать ручку в его
+// настоящей точке, она просто пропадает (canvas обрезает рисование по своим границам, а
+// там за кадром уже пусто), и её потом нечем зацепить обратно. В отличие от insetIntoCanvas
+// (рамка обрезки: круг целиком ВНУТРИ, с отступом от края на целый радиус), здесь центр
+// прижимаем ровно к самой границе канваса (без отступа) — круг оказывается ровно наполовину
+// снаружи фото, наполовину на виду, и визуально не сливается с отступающими вглубь ручками
+// рамки обрезки; а раз центр всегда строго в пределах [0,w]x[0,h], клик по нему всегда
+// попадает в сам canvas-элемент, и утянутую далеко ручку снова можно подцепить
+function outsetAtCanvasEdge(x, y, w, h) {
+  return [clamp(x, 0, w), clamp(y, 0, h)];
+}
+
+// печёт поворот (State.rotationDeg) в отдельный канвас нужного размера (как это делает
+// drawRotatedAt для основного render), а затем прогоняет его через настоящий проективный
+// варп — углы прямоугольника фото переходят в State.perspectiveQuad. Это и есть сама
+// коррекция перспективы: деформация всей картинки целиком (аналогично тому, как поворот
+// деформирует всю картинку и даёт чёрные уголки), а не вырезание/обрезка по контуру quad —
+// финальную обрезку получившихся пустых мест делает уже обычная рамка кропа
+function renderWarpedPerspective(cctx, bitmap, w, h) {
+  const rotated = document.createElement("canvas");
+  rotated.width = w;
+  rotated.height = h;
+  drawRotatedAt(rotated.getContext("2d"), bitmap, State.rotationDeg, 0, 0);
+  const warped = warpRectToQuad(rotated, State.perspectiveQuad, w, h);
+  cctx.drawImage(warped, 0, 0);
+}
+
+function renderPerspectiveFrame(cctx, scale, w, h) {
   const q = State.perspectiveQuad;
   if (!q) return;
   cctx.strokeStyle = "#ffb020";
@@ -737,18 +1718,41 @@ function renderPerspectiveFrame(cctx) {
   cctx.stroke();
 
   cctx.fillStyle = "#ffb020";
-  const handleVisualR = HANDLE_VISUAL_CSS * canvasScale();
+  const handleVisualR = HANDLE_VISUAL_CSS * scale;
+  // сама линия квада рисуется по настоящим точкам (в т.ч. за пределами канваса — так видна
+  // реальная деформация), а вот кружок-ручку там же нарисовать не получится: canvas обрезает
+  // отрисовку по своим границам, и утянутая далеко за кадр ручка попросту пропадает из виду.
+  // Поэтому кружок прижимаем к краю канваса снаружи (outsetAtCanvasEdge) — не внутрь, как
+  // ручки рамки обрезки, а именно наружу, чтобы не сливаться с ними визуально
   for (const pt of q) {
+    const [cxp, cyp] = outsetAtCanvasEdge(pt.x, pt.y, w, h);
     cctx.beginPath();
-    cctx.arc(pt.x, pt.y, handleVisualR, 0, Math.PI * 2);
+    cctx.arc(cxp, cyp, handleVisualR, 0, Math.PI * 2);
     cctx.fill();
   }
 }
 
 function renderGrid(cctx, w, h) {
   cctx.save();
-  cctx.strokeStyle = "rgba(255,255,255,0.5)";
-  cctx.lineWidth = 1;
+
+  cctx.strokeStyle = "rgba(255,255,255,0.25)";
+  cctx.lineWidth = 1.5;
+  for (let i = 1; i < 30; i++) {
+    if (i % 10 === 0) continue;
+    const x = (w * i) / 30;
+    cctx.beginPath();
+    cctx.moveTo(x, 0);
+    cctx.lineTo(x, h);
+    cctx.stroke();
+    const y = (h * i) / 30;
+    cctx.beginPath();
+    cctx.moveTo(0, y);
+    cctx.lineTo(w, y);
+    cctx.stroke();
+  }
+
+  cctx.strokeStyle = "rgba(77,163,255,0.85)";
+  cctx.lineWidth = 2.5;
   for (let i = 1; i < 3; i++) {
     const x = (w * i) / 3;
     cctx.beginPath();
@@ -761,6 +1765,7 @@ function renderGrid(cctx, w, h) {
     cctx.lineTo(w, y);
     cctx.stroke();
   }
+
   cctx.restore();
 }
 
@@ -780,33 +1785,45 @@ function cornerPoints(r) {
   ];
 }
 
+// координаты события в системе координат канваса; НЕ прижимаем их к границам канваса —
+// перетаскивание угла коррекции перспективы должно уметь выходить за пределы фото (иначе
+// невозможно вытянуть угол наружу для устранения перспективных искажений), а рамка обрезки
+// сама клэмпится ниже, в onPointerMove, по месту
 function canvasPointFromEvent(evt) {
   const c = canvas();
   const rect = c.getBoundingClientRect();
   const scaleX = c.width / rect.width;
   const scaleY = c.height / rect.height;
   return {
-    x: clamp((evt.clientX - rect.left) * scaleX, 0, c.width),
-    y: clamp((evt.clientY - rect.top) * scaleY, 0, c.height),
+    x: (evt.clientX - rect.left) * scaleX,
+    y: (evt.clientY - rect.top) * scaleY,
   };
 }
 
 function onPointerDown(evt) {
   const p = canvasPointFromEvent(evt);
 
-  if (State.perspectiveMode) {
+  // обе рамки могут быть видны одновременно — сперва проверяем ручки перспективы
+  // (у неё нет переноса всей рамки, только углы), и если промах — пробуем рамку обрезки
+  if (State.perspectiveMode && State.perspectiveQuad) {
     const quad = State.perspectiveQuad;
-    if (!quad) return;
+    const w = State.previewW, h = State.previewH;
+    const scale = canvasScale();
     for (let i = 0; i < quad.length; i++) {
-      if (Math.hypot(p.x - quad[i].x, p.y - quad[i].y) <= HANDLE_HIT_CSS * canvasScale()) {
+      // попадание проверяем по видимой (прижатой к краю канваса) точке ручки — см.
+      // outsetAtCanvasEdge/renderPerspectiveFrame — а не по настоящему углу, иначе утянутую
+      // далеко за кадр ручку, которую и так еле видно, будет ещё и нечем подцепить обратно
+      const [hx, hy] = outsetAtCanvasEdge(quad[i].x, quad[i].y, w, h);
+      if (Math.hypot(p.x - hx, p.y - hy) <= HANDLE_HIT_CSS * scale) {
         State.dragMode = "perspective-corner";
         State.dragCorner = i;
         canvas().setPointerCapture(evt.pointerId);
         return;
       }
     }
-    return; // в режиме перспективы двигаем только углы, без переноса всей рамки
   }
+
+  if (!State.cropVisible) return;
 
   const r = State.cropRect;
   const corners = cornerPoints(r);
@@ -832,20 +1849,38 @@ function onPointerMove(evt) {
   const w = State.previewW, h = State.previewH;
 
   if (State.dragMode === "perspective-corner") {
-    // угол коррекции перспективы не ограничиваем размером самого фото —
-    // именно выход угла за пределы кадра и создаёт нужную деформацию (устранение перспективных искажений),
-    // а не просто обрезку; единственная граница — сам канвас (обеспечена в canvasPointFromEvent)
-    State.perspectiveQuad[State.dragCorner] = p;
-    State.dirty = true;
-    render();
+    // угол коррекции перспективы намеренно можно тянуть за пределы фото — именно это и
+    // создаёт нужную деформацию (устранение перспективных искажений), а не обрезку; предел —
+    // щедрый, но конечный отступ от канваса, чтобы не получить вырожденный четырёхугольник
+    const marginX = w * 0.6, marginY = h * 0.6;
+    State.perspectiveQuad[State.dragCorner] = {
+      x: clamp(p.x, -marginX, w + marginX),
+      y: clamp(p.y, -marginY, h + marginY),
+    };
+    if (!perspectiveIsAtDefault()) showCropFrame();
+    // деформация перспективой меняет саму видимую границу фото — рамка обрезки должна
+    // тут же вписаться в новую границу заново (как и при повороте, см. onRotateInput),
+    // иначе она рискует остаться там, где уже нет самого фото
+    if (State.cropVisible) resetCropRect();
+    refreshDirty();
+    requestRender();
     return;
   }
 
   const r = State.cropRect;
+  // истинная видимая область фото учитывает и поворот, и (если активна) коррекцию
+  // перспективы — рамка обрезки не должна вылезать ни за одну из этих двух границ
+  const visibleQuad = photoVisibleQuad(w, h, State.rotationDeg, State.perspectiveQuad);
 
   if (State.dragMode === "move") {
-    r.x = clamp(p.x - State.dragStart.x, 0, w - r.w);
-    r.y = clamp(p.y - State.dragStart.y, 0, h - r.h);
+    // сперва свободно (в пределах канваса), затем поджимаем к реально видимой
+    // области фото — рамка может скользить вдоль её краёв, а не залипать в
+    // одном-единственном центрированном положении
+    const x = clamp(p.x - State.dragStart.x, 0, w - r.w);
+    const y = clamp(p.y - State.dragStart.y, 0, h - r.h);
+    const safe = clampMoveToQuad(x, y, r.w, r.h, visibleQuad);
+    r.x = safe.x;
+    r.y = safe.y;
   } else if (State.dragMode === "resize") {
     const anchorIdx = 3 - State.dragCorner; // противоположный угол
     const corners = cornerPoints(r);
@@ -869,11 +1904,15 @@ function onPointerMove(evt) {
     const signX = dx >= 0 ? 1 : -1;
     const signY = dy >= 0 ? 1 : -1;
 
-    // не выходить за границы канваса
+    // не выходить за пределы канваса
     const maxW = signX > 0 ? w - anchor.x : anchor.x;
     const maxH = signY > 0 ? h - anchor.y : anchor.y;
     if (newW > maxW) { newW = maxW; newH = newW / ratio; }
     if (newH > maxH) { newH = maxH; newW = newH * ratio; }
+
+    // и отдельно — за пределы реально видимой области фото
+    const safe = clampResizeToQuad(anchor, newW, newH, signX, signY, visibleQuad);
+    newW = safe.w; newH = safe.h;
     if (newW < 30) { newW = 30; newH = newW / ratio; }
 
     r.w = newW; r.h = newH;
@@ -881,12 +1920,12 @@ function onPointerMove(evt) {
     r.y = signY > 0 ? anchor.y : anchor.y - newH;
   }
   clampCropRectToCanvas(r, w, h);
-  render();
+  requestRender();
 }
 
 function onPointerUp(evt) {
   if (State.dragMode === "move" || State.dragMode === "resize") {
-    State.dirty = true;
+    refreshDirty();
   }
   State.dragMode = null;
   try { canvas().releasePointerCapture(evt.pointerId); } catch (_) {}
@@ -901,8 +1940,11 @@ async function ensureOriginalsHandle() {
 
 async function ensureCuratedHandle() {
   if (!State.curatedHandle) {
-    const folderName = State.albumHandle.name + ALBUM_SUFFIX;
+    // если такая папка уже найдена при сканировании (пусть и под старым именем после переименования
+    // родителя) — используем её, иначе создаём новую с текущим именем альбома
+    const folderName = State.curatedDirName || State.albumHandle.name + ALBUM_SUFFIX;
     State.curatedHandle = await State.albumHandle.getDirectoryHandle(folderName, { create: true });
+    State.curatedDirName = folderName;
   }
   return State.curatedHandle;
 }
@@ -957,22 +1999,26 @@ async function saveCurrent() {
     fullCtx.fillRect(0, 0, fullCanvas.width, fullCanvas.height);
     drawRotated(fullCtx, State.fullBitmap, State.rotationDeg);
 
-    let outCanvas;
-    if (State.perspectiveMode && State.perspectiveQuad) {
+    // коррекция перспективы, как и поворот, деформирует всё изображение целиком (в fullCanvas,
+    // ещё до кропа) — итоговую вырезку из получившегося результата делает та же самая, уже
+    // существующая рамка обрезки, что и для обычного (без перспективы) фото, без отдельной ветки
+    let sourceCanvas = fullCanvas;
+    if (State.perspectiveMode && State.perspectiveQuad && !perspectiveIsAtDefault()) {
       setStatus("status-bar", "Обрабатываю перспективу " + item.name + "...");
       const fullQuad = State.perspectiveQuad.map((pt) => ({ x: pt.x * scale, y: pt.y * scale }));
-      outCanvas = exportPerspectiveCrop(fullCanvas, fullQuad, State.aspect.w, State.aspect.h, colorOpts);
-    } else {
-      clampCropRectToCanvas(State.cropRect, State.previewW, State.previewH);
-      const fullRect = {
-        x: State.cropRect.x * scale,
-        y: State.cropRect.y * scale,
-        w: State.cropRect.w * scale,
-        h: State.cropRect.h * scale,
-      };
-      outCanvas = exportCrop(fullCanvas, fullRect, colorOpts);
+      sourceCanvas = warpRectToQuad(fullCanvas, fullQuad, fullCanvas.width, fullCanvas.height);
     }
-    const blob = await new Promise((resolve) => outCanvas.toBlob(resolve, "image/jpeg", 0.92));
+    clampCropRectToCanvas(State.cropRect, State.previewW, State.previewH);
+    const fullRect = {
+      x: State.cropRect.x * scale,
+      y: State.cropRect.y * scale,
+      w: State.cropRect.w * scale,
+      h: State.cropRect.h * scale,
+    };
+    const outCanvas = exportCrop(sourceCanvas, fullRect, colorOpts);
+    const rawBlob = await new Promise((resolve) => outCanvas.toBlob(resolve, "image/jpeg", 0.92));
+    // canvas.toBlob() стирает весь EXIF — возвращаем камеру/дату/GPS исходного фото
+    const blob = await injectExif(rawBlob, State.currentExif);
 
     const originalsHandle = await ensureOriginalsHandle();
     if (!item.edited) {
@@ -1002,7 +2048,7 @@ async function saveCurrent() {
 
     await regenerateThumbFromFile(item, blob);
     updateThumbImg(State.index);
-    await loadPhoto(item); // подтягиваем в редактор реально сохранённый файл, а не только миниатюру
+    await loadPhoto(item, blob); // blob уже в памяти — не перечитываем только что записанный файл с диска
 
     setStatus("status-bar", "Сохранено: " + item.name);
   } catch (e) {
@@ -1011,13 +2057,21 @@ async function saveCurrent() {
   }
 }
 
+// сразу после createWritable().close() чтение через тот же хэндл иногда на миг отдаёт
+// не до конца прилетевший размер (кэш ФС/антивирус) — пара коротких повторов вместо
+// немедленного отказа убирает ложные "восстановление/сохранение не удалось"
 async function verifyWrittenSize(fileHandle, expectedSize, label) {
-  const writtenFile = await fileHandle.getFile();
-  if (writtenFile.size !== expectedSize) {
-    throw new Error(
-      `после записи "${label}" размер файла не совпал (ожидался ${expectedSize} байт, на диске ${writtenFile.size} байт)`
-    );
+  const delays = [0, 60, 200];
+  let lastSize = -1;
+  for (const delay of delays) {
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    const writtenFile = await fileHandle.getFile();
+    lastSize = writtenFile.size;
+    if (lastSize === expectedSize) return;
   }
+  throw new Error(
+    `после записи "${label}" размер файла не совпал (ожидался ${expectedSize} байт, на диске ${lastSize} байт)`
+  );
 }
 
 async function restoreOriginal() {
@@ -1025,51 +2079,482 @@ async function restoreOriginal() {
   if (!item.edited) return;
   setStatus("status-bar", "Восстанавливаю оригинал " + item.name + "...");
 
+  let originalsHandle, backupFile;
   try {
-    const originalsHandle = await ensureOriginalsHandle();
-    const backupFile = await (await originalsHandle.getFileHandle(item.name)).getFile();
+    originalsHandle = await ensureOriginalsHandle();
+    backupFile = await (await originalsHandle.getFileHandle(item.name)).getFile();
 
     const writable = await item.handle.createWritable();
     await writable.write(backupFile);
     await writable.close();
     await verifyWrittenSize(item.handle, backupFile.size, item.name);
-
-    // бэкап больше не нужен — после удаления имя в .Originals однозначно означает "сейчас отредактировано"
-    await originalsHandle.removeEntry(item.name);
-    item.edited = false;
-    updateThumbBadge(State.index);
-    el("restore-btn").disabled = true;
-
-    if (item.starred) {
-      await syncCuratedCopy(item, backupFile);
-    }
-
-    await regenerateThumbFromFile(item, backupFile);
-    updateThumbImg(State.index);
-    await loadPhoto(item);
-
-    setStatus("status-bar", "Оригинал восстановлен: " + item.name);
   } catch (e) {
     console.error("Ошибка восстановления", item.name, e);
     setStatus("status-bar", "Ошибка восстановления " + item.name + ": " + e.message);
+    return;
+  }
+
+  // главное сделано — файл на диске восстановлен; дальше обновляем состояние и вид
+  // независимо от того, получится ли подчистить сопутствующие копии ниже — иначе сбой
+  // уборки в .Originals/куррейтед-папке (например, файл на миг занят антивирусом) откатывал
+  // бы уже состоявшееся восстановление, и альбом с превью оставались бы необновлёнными
+  const wasStarred = item.starred;
+  item.edited = false;
+  updateThumbBadge(State.index);
+  el("restore-btn").disabled = true;
+  if (wasStarred) {
+    item.starred = false;
+    updateThumbStar(State.index);
+    updateStarButton(item);
+  }
+
+  await regenerateThumbFromFile(item, backupFile);
+  updateThumbImg(State.index);
+  await loadPhoto(item, backupFile); // backupFile уже в памяти — не перечитываем с диска
+  setStatus("status-bar", "Оригинал восстановлен: " + item.name);
+
+  // бэкап и куррейтед-копия больше не нужны — уборка не критична для результата,
+  // поэтому её сбой только логируется, не мешая уже показанному восстановлению
+  try {
+    await originalsHandle.removeEntry(item.name);
+  } catch (e) {
+    console.warn("Не удалось удалить резервную копию из .Originals", item.name, e);
+  }
+  if (wasStarred) {
+    try {
+      const curatedHandle = await ensureCuratedHandle();
+      await curatedHandle.removeEntry(item.name);
+    } catch (e) {
+      console.warn("Не удалось удалить копию из куррейтед-альбома", item.name, e);
+    }
   }
 }
 
-function resetFrame() {
-  resetCropRect();
-  State.dirty = true;
+// выбор формата кадра без видимой рамки обрезки непонятен — не видно, что́ он вообще
+// обрежет, поэтому select показываем синхронно с самой рамкой, а не отдельным переключателем
+function syncCropFrameUI() {
+  el("reset-btn").classList.toggle("active", State.cropVisible);
+  el("aspect-control").hidden = !State.cropVisible;
+}
+
+// рамка обрезки скрыта по умолчанию — эта кнопка включает/выключает её показ; при включении
+// заодно сбрасывает рамку на формат по умолчанию (раньше это был единственный смысл кнопки)
+function toggleCropFrame() {
+  State.cropVisible = !State.cropVisible;
+  syncCropFrameUI();
+  if (State.cropVisible) resetCropRect();
+  refreshDirty();
   render();
+}
+
+// поворот (жёсткий на 90°/зеркало или точная подстройка угла) почти всегда требует потом
+// подрезать съехавшие края — сразу показываем рамку обрезки, чтобы не заставлять искать
+// эту кнопку отдельно каждый раз после поворота
+function showCropFrame() {
+  if (State.cropVisible) return;
+  State.cropVisible = true;
+  syncCropFrameUI();
+}
+
+// полноэкранный просмотр (двойной клик по фото, кнопка "Полный экран" или слайдшоу — все три
+// ведут в один и тот же настоящий Fullscreen API на canvas-wrap) — только сама фотография,
+// без панелей; переход между фото — стрелками/колесом (см. onViewerKeydown/canvas-wrap wheel)
+function enterFullscreen() {
+  if (!State.fullBitmap || document.fullscreenElement) return;
+  el("canvas-wrap").requestFullscreen();
+}
+
+function isFullscreenViewer() {
+  return document.fullscreenElement === el("canvas-wrap");
+}
+
+function toggleFullscreenBtn() {
+  if (isFullscreenViewer()) document.exitFullscreen();
+  else enterFullscreen();
+}
+
+// вход и выход из fullscreen пересчитывают масштаб одним и тем же fitPreviewToWindow — раньше
+// вход отдавали чистому CSS (object-fit: contain), а это давало canvas шириной/высотой во весь
+// экран с картинкой внутри "в рамке" (letterbox); getBoundingClientRect() такого canvas
+// возвращал размер всего экрана, а не видимой части фото — из-за этого при первом переходе
+// слайдшоу снимок для наплыва (snapshotFadeFrame) растягивался на весь экран. Явный px-размер
+// от fitPreviewToWindow всегда точно облегает видимую картинку, этой рассинхронизации не будет
+function onFullscreenChange() {
+  const active = isFullscreenViewer();
+  el("fullscreen-btn").classList.toggle("active", active);
+  fitPreviewToWindow();
+  if (!active) {
+    // Esc/системный выход из fullscreen во время слайдшоу — гасим его вместе с ним; проверяем
+    // класс кнопки, а не slideshowTimer — таймер ещё не выставлен, пока startSlideshow ждёт
+    // сканирование папки "Music", но кнопка уже помечена активной
+    if (el("slideshow-btn").classList.contains("active")) stopSlideshow();
+  }
+}
+
+let slideshowTimer = null;
+let slideshowGeneration = 0; // растёт при каждом старте/остановке — отличает актуальный запуск от отменённого во время await
+const MUSIC_EXT = /\.(mp3|m4a|aac|ogg|wav|flac)$/i;
+let musicObjectUrl = null; // текущий URL проигрываемого трека — освобождаем перед каждой заменой
+
+// слайдшоу — тот же настоящий Fullscreen API, что и обычный полноэкранный просмотр,
+// плюс автопереход по таймеру; поэтому Esc сам его останавливает через onFullscreenChange
+function toggleSlideshow() {
+  if (el("slideshow-btn").classList.contains("active")) stopSlideshow();
+  else startSlideshow();
+}
+
+// папка "Music" в корне дерева (рядом с папками альбома) — необязательная: если её нет,
+// слайдшоу просто идёт без звука; результат кэшируется на State.rootHandle, чтобы не
+// пересканировать диск при каждом запуске/остановке слайдшоу в одной и той же сессии
+async function ensureMusicPlaylist() {
+  if (State.musicRootHandle === State.rootHandle) return State.musicFiles;
+  State.musicRootHandle = State.rootHandle;
+  State.musicFiles = [];
+  if (!State.rootHandle) return State.musicFiles;
+  try {
+    const musicHandle = await State.rootHandle.getDirectoryHandle("Music");
+    const files = [];
+    for await (const entry of musicHandle.values()) {
+      if (entry.kind === "file" && MUSIC_EXT.test(entry.name)) files.push(entry);
+    }
+    files.sort((a, b) => a.name.localeCompare(b.name));
+    State.musicFiles = files;
+  } catch (_) {
+    // папки "Music" нет в корне альбома — фоновая музыка необязательна
+  }
+  return State.musicFiles;
+}
+
+async function playMusicTrack(index) {
+  const files = State.musicFiles;
+  if (files.length === 0) return;
+  const audio = el("slideshow-audio");
+  const file = await files[index % files.length].getFile();
+  if (musicObjectUrl) URL.revokeObjectURL(musicObjectUrl);
+  musicObjectUrl = URL.createObjectURL(file);
+  audio.src = musicObjectUrl;
+  // без пользовательского жеста браузер мог бы заблокировать автовоспроизведение, но
+  // слайдшоу и так запускается по клику — жест уже есть
+  audio.play().catch(() => {});
+}
+
+function stopMusic() {
+  const audio = el("slideshow-audio");
+  audio.onended = null;
+  audio.pause();
+  audio.removeAttribute("src");
+  audio.load();
+  if (musicObjectUrl) {
+    URL.revokeObjectURL(musicObjectUrl);
+    musicObjectUrl = null;
+  }
+}
+
+async function startSlideshow() {
+  if (slideshowTimer || State.queue.length === 0) return;
+  const myGeneration = ++slideshowGeneration;
+  el("slideshow-btn").classList.add("active");
+  if (!isFullscreenViewer()) el("canvas-wrap").requestFullscreen();
+
+  const playlist = await ensureMusicPlaylist();
+  if (myGeneration !== slideshowGeneration) return; // слайдшоу уже остановили, пока читали папку "Music"
+  if (playlist.length > 0) {
+    const audio = el("slideshow-audio");
+    let trackIndex = Math.floor(Math.random() * playlist.length);
+    audio.onended = () => {
+      trackIndex = (trackIndex + 1) % playlist.length;
+      playMusicTrack(trackIndex);
+    };
+    playMusicTrack(trackIndex);
+  }
+
+  slideshowTimer = setInterval(async () => {
+    // при несохранённых правках молча останавливаемся, а не выскакиваем с диалогом
+    // "сохранить?" поверх слайдшоу без присмотра пользователя
+    if (State.dirty) { stopSlideshow(); return; }
+    snapshotFadeFrame(); // накрываем текущий кадр его собственным снимком — сейчас под ним начнёт рисоваться следующий
+    await selectPhoto((State.index + 1) % State.queue.length); // основной canvas уже перерисован под снимком, зритель этого не видит
+    dissolveFadeFrame(); // и только теперь плавно растворяем снимок сверху — наплыв, а не затухание в чёрное
+  }, 4000);
+}
+
+// копирует текущий кадр в наложенный сверху canvas (пиксели один в один, тот же видимый размер)
+// и мгновенно показывает его непрозрачным — без анимации, это лишь подготовка к наплыву
+function snapshotFadeFrame() {
+  const src = canvas();
+  const fade = el("slideshow-fade-canvas");
+  fade.width = src.width;
+  fade.height = src.height;
+  fade.getContext("2d").drawImage(src, 0, 0);
+  // берём фактический отображаемый размер (getBoundingClientRect), а не style.width/height —
+  // в fullscreen размер задаёт CSS (object-fit: contain), инлайновых width/height там нет
+  const rect = src.getBoundingClientRect();
+  fade.style.width = rect.width + "px";
+  fade.style.height = rect.height + "px";
+  fade.style.transition = "none"; // без этого прыжок в opacity:1 сам мгновенно анимировался бы transition'ом ниже
+  fade.style.opacity = "1";
+  void fade.offsetHeight; // форсируем reflow, чтобы браузер применил opacity:1 без анимации до возврата transition
+  fade.style.transition = "";
+}
+
+// плавно растворяет снимок предыдущего кадра, открывая уже отрисованный под ним следующий — наплыв
+function dissolveFadeFrame() {
+  el("slideshow-fade-canvas").style.opacity = "0";
+}
+
+// безопасно вызывать в любой момент — в том числе пока startSlideshow ещё не успел выставить
+// slideshowTimer (ждёт ensureMusicPlaylist): все шаги ниже — идемпотентные no-op на пустом состоянии
+function stopSlideshow() {
+  slideshowGeneration++; // отменяет незавершённый запуск, если он есть
+  clearInterval(slideshowTimer);
+  slideshowTimer = null;
+  el("slideshow-btn").classList.remove("active");
+  el("slideshow-fade-canvas").style.opacity = "0"; // на случай остановки посреди наплыва
+  stopMusic();
+  if (isFullscreenViewer()) document.exitFullscreen();
+}
+
+// панели слева/снизу можно скрыть вручную кнопками в верхней панели состояния — независимо
+// от полноэкранного просмотра, просто чтобы освободить место под фото в обычном окне
+function toggleLeftPanel() {
+  const shown = document.body.classList.toggle("hide-left") === false;
+  el("toggle-left-btn").classList.toggle("active", shown);
+}
+
+// кнопки "низ"/"вправо" переключают, где стоит лента привью — не независимая пара
+// показать/скрыть, а взаимоисключающий выбор стороны: клик по уже активной стороне просто
+// прячет/показывает ленту там же (старое поведение), клик по другой стороне переносит ленту
+// туда (и включает её, если до этого была скрыта)
+function toggleBottomPanel() {
+  const body = document.body;
+  if (body.classList.contains("panel-right")) {
+    body.classList.remove("panel-right");
+    body.classList.remove("hide-bottom");
+    // ширина ленты (её собственный "боковой" размер) больше не действует в нижнем режиме —
+    // иначе унаследованный inline-стиль ужимает ленту, растянутую по CSS на всю ширину
+    el("album-grid").style.width = "";
+  } else {
+    body.classList.toggle("hide-bottom");
+  }
+  syncPreviewPanelButtons();
+  savePanelMode();
+  updateThumbSizing();
+}
+
+function toggleRightPanel() {
+  const body = document.body;
+  if (!body.classList.contains("panel-right")) {
+    body.classList.add("panel-right");
+    body.classList.remove("hide-bottom");
+    // и наоборот — высота, унаследованная от нижнего режима, не должна мешать ленте
+    // растянуться на всю доступную высоту в боковом режиме
+    el("album-grid").style.height = "";
+    // свежий вход в боковой режим всегда начинается с 1 столбика — иначе гистерезис в
+    // updateThumbSizing() унаследовал бы число столбиков от прошлого раза и мог ошибочно
+    // остаться на нём же при той же ширине ленты
+    rightPanelCols = 1;
+  } else {
+    body.classList.toggle("hide-bottom");
+  }
+  syncPreviewPanelButtons();
+  savePanelMode();
+  updateThumbSizing();
+}
+
+function syncPreviewPanelButtons() {
+  const body = document.body;
+  const shown = !body.classList.contains("hide-bottom");
+  const right = body.classList.contains("panel-right");
+  el("toggle-bottom-btn").classList.toggle("active", shown && !right);
+  el("toggle-right-btn").classList.toggle("active", shown && right);
+}
+
+// запоминает текущее положение ленты (снизу/сбоку, показана/скрыта), чтобы при следующем
+// открытии редактора она открылась там же, где её оставили — раньше всегда стартовала снизу
+function savePanelMode() {
+  const body = document.body;
+  const right = body.classList.contains("panel-right") ? "right" : "bottom";
+  const hidden = body.classList.contains("hide-bottom") ? "-hidden" : "";
+  localStorage.setItem(PANEL_MODE_STORAGE_KEY, right + hidden);
+}
+
+// размер, до которого может дорасти миниатюра в 2+ столбика (примерно на треть больше, чем было
+// раньше, ~110px) — пока места меньше, миниатюра растёт вместе с шириной ленты (обычное точное
+// деление, без пустот), а начиная с этого потолка лишняя ширина уже не идёт в размер, а копится
+// как задел на появление следующего столбика (см. GROW_PEEK)
+const RIGHT_THUMB_CAP = 145;
+const RIGHT_GAP = 8;
+// сколько места (px) сверх точного вмещения текущих столбиков нужно накопить, чтобы появился
+// следующий — было 110px (столбик появлялся, только когда набегало место на целый новый
+// полноразмерный), стало всего 40px, поэтому лента заметно раньше показывает следующий столбик
+const RIGHT_GROW_PEEK = 40;
+
+// ширина, при которой текущие n столбиков (n >= 2) уже вмещаются на полный RIGHT_THUMB_CAP
+// каждый, без обрезки
+function rightColFullWidth(n) {
+  return n * (RIGHT_THUMB_CAP + RIGHT_GAP) - RIGHT_GAP;
+}
+
+// граница (в пикселях доступной ширины), после которой в боковой ленте появляется (n+1)-й
+// столбик — первый столбик растёт свободно до 220px (это чуть больше ширины ленты по умолчанию,
+// чтобы вход в боковой режим не подкидывал сразу 2 столбика); каждый следующий столбик появляется,
+// как только накопится RIGHT_GROW_PEEK лишнего места сверх точного вмещения предыдущих
+function rightColGrowBoundary(n) {
+  return n === 1 ? 220 : rightColFullWidth(n) + RIGHT_GROW_PEEK;
+}
+
+// текущее число столбиков боковой ленты — хранится между вызовами updateThumbSizing(), это и
+// есть "память" петли гистерезиса (см. ниже); сбрасывается на 1 при каждом свежем включении
+// бокового режима (toggleRightPanel), чтобы не унаследовать число столбиков от предыдущего сеанса
+let rightPanelCols = 1;
+
+// пересчитывает размер миниатюр под текущую ширину/высоту ленты (см. .thumb в style.css) —
+// нижний режим просто использует доступную высоту ленты напрямую (одна строка, перенос не
+// нужен — лишнее уезжает по горизонтали); боковой режим делит доступную ширину на rightPanelCols
+// столбиков (см. RIGHT_THUMB_CAP — потолок роста), а само число столбиков меняется через петлю
+// гистерезиса (rightColGrowBoundary) — появление и исчезновение столбика происходит на РАЗНЫХ
+// границах ширины: столбик добавляется, как только пересечена его граница появления, а убирается
+// только когда ширина отступает от неё заметно (на HYSTERESIS px) назад — иначе на границе ширина
+// туда-обратно на пиксель заставляла бы столбик дёргаться туда-сюда
+// собирает миниатюры (в порядке data-index, а не текущего положения в DOM) обратно прямыми
+// детьми #album-grid и убирает опустевшие обёртки .thumb-col — нужно как перед переходом в
+// нижний режим (там раскладка по столбикам не нужна вовсе), так и перед перекладкой боковой
+// ленты на новое число столбиков (проще собрать по новой, чем аккуратно перемещать частями)
+function flattenRightColumns(grid) {
+  const thumbs = [...grid.querySelectorAll(".thumb")].sort((a, b) => a.dataset.index - b.dataset.index);
+  thumbs.forEach((t) => grid.appendChild(t));
+  grid.querySelectorAll(":scope > .thumb-col").forEach((w) => w.remove());
+}
+
+// раскладывает миниатюры по cols обёрткам-столбикам подряд, сверху вниз — сначала все,
+// сколько влезет, в первый столбик, потом следующий и т.д. (первые ceil(count/cols) индексов
+// уходят в столбик 0, следующие столько же — в столбик 1, и т.д.); у миниатюр разная высота
+// (см. .thumb в style.css — теперь она подстраивается под настоящие пропорции кадра), поэтому
+// в отличие от прежней CSS grid-раскладки высоту столбиков тут никто явно не считает — просто
+// сколько есть, столько и уходит вниз, а лента целиком прокручивается по вертикали при переполнении
+// во время перетаскивания границы ленты updateThumbSizing() вызывается на каждое движение
+// мыши, но число столбиков (в отличие от --thumb-size) меняется далеко не на каждом кадре —
+// перекладывать миниатюры по DOM заново, когда лента уже разложена ровно на cols обёрток,
+// незачем (а после buildGrid()/showColorVariantPicker() дети всегда плоские — .thumb напрямую,
+// без .thumb-col, — поэтому свежепостроенная лента здесь никогда не пропустит перекладку)
+function layoutRightColumns(grid, cols) {
+  const alreadyLaidOut = grid.children.length === cols && [...grid.children].every((c) => c.classList.contains("thumb-col"));
+  if (alreadyLaidOut) return;
+  flattenRightColumns(grid);
+  const thumbs = [...grid.querySelectorAll(".thumb")];
+  const perCol = Math.max(1, Math.ceil(thumbs.length / cols));
+  const wraps = [];
+  for (let c = 0; c < cols; c++) {
+    const wrap = document.createElement("div");
+    wrap.className = "thumb-col";
+    grid.appendChild(wrap);
+    wraps.push(wrap);
+  }
+  thumbs.forEach((t, i) => {
+    wraps[Math.min(cols - 1, Math.floor(i / perCol))].appendChild(t);
+  });
+}
+
+function updateThumbSizing() {
+  const grid = el("album-grid");
+  if (document.body.classList.contains("panel-right")) {
+    const w = grid.getBoundingClientRect().width;
+    const available = Math.max(30, w - 24);
+    const HYSTERESIS = 25;
+    while (available >= rightColGrowBoundary(rightPanelCols)) rightPanelCols++;
+    while (rightPanelCols > 1 && available < rightColGrowBoundary(rightPanelCols - 1) - HYSTERESIS) rightPanelCols--;
+    const cols = rightPanelCols;
+    let size = (available - RIGHT_GAP * (cols - 1)) / cols;
+    if (cols > 1) size = Math.min(size, RIGHT_THUMB_CAP);
+    grid.style.setProperty("--thumb-size", size + "px");
+    layoutRightColumns(grid, cols);
+  } else {
+    flattenRightColumns(grid);
+    const h = grid.getBoundingClientRect().height;
+    const size = Math.max(30, h - 20);
+    grid.style.setProperty("--thumb-size", size + "px");
+  }
+}
+
+// стрелки листают фото по всей ленте — и в обычном окне, и в полноэкранном просмотре/слайдшоу
+// (переход всегда идёт через goToPhoto, так что спросит про сохранение, если в текущем фото
+// есть несохранённые правки); не перехватываем стрелки, когда они нужны для чего-то другого —
+// ползунок угла, выпадающий список формата, поля ввода, модалки, палитра
+function onViewerKeydown(evt) {
+  if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(evt.key)) return;
+  if (!State.fullBitmap) return;
+  if (!el("unsaved-modal").hidden || !el("about-modal").hidden) return;
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+
+  // в подборе цвета лента показывает не фото альбома, а варианты текущего кадра — тем же
+  // порядком стрелок листаем их, а не State.queue
+  if (State.colorPickerActive) {
+    const current = el("album-grid").querySelector(".variant-thumb.active") || el("album-grid").querySelector(".variant-thumb");
+    const next = current && findGridNeighbor(current, evt.key);
+    if (!next) return;
+    evt.preventDefault();
+    next.click();
+    return;
+  }
+
+  const current = thumbAt(State.index);
+  const next = current && findGridNeighbor(current, evt.key);
+  if (!next) return;
+  evt.preventDefault();
+  goToPhoto(+next.dataset.index);
+}
+
+// находит соседнюю миниатюру по стрелке, опираясь на настоящую DOM-структуру ленты, а не на
+// арифметику индексов (index +/- perCol) — в боковом режиме последний столбик почти всегда
+// короче остальных (perCol не делит общее число миниатюр нацело, см. layoutRightColumns), и
+// наивный прыжок на perCol индексов вперёд из "длинной" строки короткого столбика промахивался
+// бы мимо диапазона и застревал, не доходя до последнего столбика; тут же для влево/вправо
+// просто берём тот же (или ближайший существующий, если столбик короче) ряд соседней обёртки
+// .thumb-col, а для вверх/вниз — соседа по DOM-порядку внутри столбика
+function findGridNeighbor(current, key) {
+  const parent = current.parentElement;
+  if (parent.classList.contains("thumb-col")) {
+    const items = [...parent.children];
+    const row = items.indexOf(current);
+    if (key === "ArrowUp") return items[row - 1] || null;
+    if (key === "ArrowDown") return items[row + 1] || null;
+    const cols = [...parent.parentElement.children].filter((c) => c.classList.contains("thumb-col"));
+    const targetCol = cols[cols.indexOf(parent) + (key === "ArrowLeft" ? -1 : 1)];
+    if (!targetCol) return null;
+    const targetItems = [...targetCol.children];
+    return targetItems[Math.min(row, targetItems.length - 1)] || null;
+  }
+  // нижний режим: один горизонтальный ряд прямых детей ленты, вверх/вниз тут не при делах
+  if (key === "ArrowUp" || key === "ArrowDown") return null;
+  const items = [...parent.children];
+  const idx = items.indexOf(current);
+  return items[idx + (key === "ArrowLeft" ? -1 : 1)] || null;
 }
 
 function onRotateInput(evt) {
   State.rotationDeg = parseFloat(evt.target.value);
-  el("rotate-value").textContent = State.rotationDeg.toFixed(1) + "°";
-  State.dirty = true;
+  // пользователь сам поправил угол вручную — сообщение об ошибке автогоризонта (не нашёл
+  // линию / угол слишком большой) больше не актуально и будет противоречить видимому углу;
+  // явно говорим, что дальше это уже ручная правка, а не оценка автогоризонта
+  setStatus("status-bar", "Угол задан вручную — не проверял.");
+  // рамка динамически следит за реально видимым (без чёрных углов) краем повёрнутого фото —
+  // при увеличении угла она уменьшается, чтобы показывать только целую картинку; должна
+  // пересчитаться РАНЬШЕ refreshDirty(), иначе cropIsAtDefault() сравнивает новый угол со
+  // старой (ещё не пересчитанной) рамкой и застревает в dirty:true даже при возврате к 0
+  resetCropRect();
+  // текст лейбла обновляем в render() (раз за кадр), а не на каждое сырое input-событие —
+  // нативный слайдер при перетаскивании может слать их гораздо чаще кадра, и текстовый
+  // reflow на каждое из них заметно подтормаживал сам ползунок
+  refreshDirty();
   if (!State.showGrid) {
     State.showGrid = true;
     el("grid-btn").classList.add("active");
   }
-  render();
+  // ненулевой угол заваливает чёрные уголки по краям — без рамки обрезки их легко забыть
+  // подрезать и сохранить фото прямо с ними
+  showCropFrame();
+  requestRender();
 }
 
 // смена формата рамки — выбор запоминается (localStorage) и действует для всех фото альбома,
@@ -1078,8 +2563,11 @@ function onAspectChange(evt) {
   const preset = ASPECT_PRESETS.find((p) => p.key === evt.target.value) || ASPECT_PRESETS[0];
   State.aspect = preset;
   localStorage.setItem(ASPECT_STORAGE_KEY, preset.key);
+  // выбор формата кадра без видимой рамки обрезки непонятен — не видно, что вообще изменилось
+  State.cropVisible = true;
+  syncCropFrameUI();
   resetCropRect();
-  State.dirty = true;
+  refreshDirty();
   render();
 }
 
@@ -1093,14 +2581,17 @@ function togglePerspectiveMode() {
   State.perspectiveMode = !State.perspectiveMode;
   el("perspective-btn").classList.toggle("active", State.perspectiveMode);
   if (State.perspectiveMode && !State.perspectiveQuad) {
-    const r = State.cropRect;
+    // рамку перспективы стартуем от истинных краёв фото (а не от узкой рамки обрезки под
+    // выбранный формат) — коррекцию перспективы обычно делают на всём кадре, до кропа
+    const w = State.previewW, h = State.previewH;
     State.perspectiveQuad = [
-      { x: r.x, y: r.y },
-      { x: r.x + r.w, y: r.y },
-      { x: r.x + r.w, y: r.y + r.h },
-      { x: r.x, y: r.y + r.h },
+      { x: 0, y: 0 },
+      { x: w, y: 0 },
+      { x: w, y: h },
+      { x: 0, y: h },
     ];
   }
+  refreshDirty();
   render();
 }
 
@@ -1148,18 +2639,22 @@ async function showColorVariantPicker() {
   freezeEditingControls(true);
 
   const grid = el("album-grid");
+  grid.classList.add("color-picker-mode");
   grid.innerHTML = "";
   const variants = await generateColorVariants();
   grid.innerHTML = "";
-  variants.forEach(({ preset, url }) => {
+  variants.forEach(({ preset, url }, i) => {
     const btn = document.createElement("button");
     btn.className = "thumb variant-thumb";
+    btn.dataset.index = i;
     if (State.colorVariant.key === preset.key) btn.classList.add("active");
     btn.title = preset.label;
 
     const img = document.createElement("img");
     img.src = url;
     img.alt = preset.label;
+    img.classList.add("loaded"); // без этого класса миниатюра остаётся opacity:0 (чёрный квадрат) —
+    // "loaded" обычно навешивается при подгрузке фонового thumbUrl, а тут картинка уже готова сразу
     btn.appendChild(img);
 
     const label = document.createElement("span");
@@ -1167,20 +2662,50 @@ async function showColorVariantPicker() {
     label.textContent = preset.label;
     btn.appendChild(label);
 
-    btn.addEventListener("click", () => selectColorVariant(preset));
+    btn.addEventListener("click", () => selectColorVariant(preset, btn));
+    // один клик — примерка варианта без выхода из подбора (чтобы можно было сравнивать
+    // несколько подряд), двойной клик — явное "выбрал, закрываю"
+    btn.addEventListener("dblclick", () => exitColorVariantPicker());
     grid.appendChild(btn);
   });
+  // вариантов обычно меньше, чем фото в альбоме — число строк на столбец в боковом режиме
+  // пересчитываем под новое количество элементов ленты
+  updateThumbSizing();
 }
 
-function selectColorVariant(preset) {
+// собирает миниатюру текущего фото с уже применённым цветовым вариантом — не трогая диск,
+// только для показа в альбоме после возврата из подбора (см. loadPhoto: та же логика
+// "записать в память, затем показать", что и после сохранения/восстановления)
+function buildColoredCroppedCanvas() {
+  const canvas = getCroppedPreviewCanvas();
+  if (State.colorVariant.key === COLOR_VARIANTS[0].key) return canvas; // "Оригинал" — обработка не нужна
+  const ctx = canvas.getContext("2d");
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  applyColorTreatment(imgData, {
+    saturationBoost: State.colorVariant.saturationBoost,
+    clipPercent: State.colorVariant.clipPercent,
+    warm: State.colorVariant.warm,
+  });
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+}
+
+async function selectColorVariant(preset, btn) {
   State.colorVariant = preset;
-  State.dirty = true;
-  exitColorVariantPicker();
+  refreshDirty();
+  refreshDisplayBitmap();
+  requestRender();
+  // сетка сейчас показывает варианты, а не фото альбома — подсвечиваем выбранный вариант,
+  // а не тянем highlightActiveThumb()/updateThumbImg(), которые перепутали бы содержимое кнопок
+  el("album-grid").querySelectorAll(".variant-thumb").forEach((b) => b.classList.toggle("active", b === btn));
+  const item = State.queue[State.index];
+  if (item) await regenerateThumbFromFile(item, buildColoredCroppedCanvas());
 }
 
 function exitColorVariantPicker() {
   State.colorPickerActive = false;
   el("color-btn").classList.remove("active");
+  el("album-grid").classList.remove("color-picker-mode");
   freezeEditingControls(false);
   buildGrid();
   State.queue.forEach((_, i) => updateThumbImg(i));
@@ -1211,6 +2736,7 @@ function makeResizable(resizerEl, targetEl, axis, opts = {}) {
     const saved = localStorage.getItem(storageKey);
     if (saved) targetEl.style[prop] = clamp(parseInt(saved, 10), min, max) + "px";
   }
+  opts.onResize?.();
 
   resizerEl.addEventListener("pointerdown", (evt) => {
     evt.preventDefault();
@@ -1225,6 +2751,7 @@ function makeResizable(resizerEl, targetEl, axis, opts = {}) {
       const pos = axis === "x" ? e.clientX : e.clientY;
       const newSize = clamp(startSize + sign * (pos - startPos), min, max);
       targetEl.style[prop] = newSize + "px";
+      opts.onResize?.();
     }
     function onUp() {
       resizerEl.classList.remove("dragging");
@@ -1241,10 +2768,41 @@ function makeResizable(resizerEl, targetEl, axis, opts = {}) {
 }
 
 function init() {
+  // клик мышью по любой кнопке тулбара (сменить фото, включить рамку/перспективу и т.п.)
+  // иначе оставляет на ней нативную рамку фокуса, которая никуда не девается при дальнейшей
+  // работе — как и для миниатюр альбома (см. buildGrid), гасим фокус только по клику мышью;
+  // Tab с клавиатуры по-прежнему фокусирует кнопки как обычно
+  document.addEventListener("mousedown", (evt) => {
+    if (evt.target.closest("button")) evt.preventDefault();
+  });
+
+  // панель параметров всегда подстраивается под контент (см. CSS) — высота
+  // больше не сохраняется вручную; убираем инлайн-высоту, оставшуюся от
+  // старого перетаскиваемого разделителя, если она есть в localStorage
+  localStorage.removeItem("folderTreeHeight");
+  localStorage.removeItem("propertiesPanelHeight");
+  el("folder-tree").style.height = "";
+  el("properties-panel").style.height = "";
+
   const savedAspectKey = localStorage.getItem(ASPECT_STORAGE_KEY);
   State.aspect = ASPECT_PRESETS.find((p) => p.key === savedAspectKey) || ASPECT_PRESETS[0];
   el("aspect-select").value = State.aspect.key;
   el("aspect-select").addEventListener("change", onAspectChange);
+
+  const savedAutoHorizon = localStorage.getItem(AUTO_HORIZON_STORAGE_KEY);
+  State.autoHorizonEnabled = savedAutoHorizon === null ? true : savedAutoHorizon === "1";
+  el("auto-horizon-btn").classList.toggle("active", State.autoHorizonEnabled);
+  el("auto-horizon-btn").addEventListener("click", toggleAutoHorizon);
+
+  // положение ленты привью (снизу/сбоку, показана/скрыта) запоминается между сеансами —
+  // см. savePanelMode() в toggleBottomPanel/toggleRightPanel; без сохранённого значения лента
+  // остаётся в исходном нижнем режиме, заданном в разметке
+  const savedPanelMode = localStorage.getItem(PANEL_MODE_STORAGE_KEY);
+  if (savedPanelMode) {
+    document.body.classList.toggle("panel-right", savedPanelMode.startsWith("right"));
+    document.body.classList.toggle("hide-bottom", savedPanelMode.endsWith("-hidden"));
+  }
+  syncPreviewPanelButtons();
 
   el("settings-btn").addEventListener("click", openAboutModal);
   el("about-close-btn").addEventListener("click", closeAboutModal);
@@ -1252,20 +2810,67 @@ function init() {
     if (evt.target.id === "about-modal") closeAboutModal();
   });
 
+  el("properties-edit-btn").addEventListener("click", () => {
+    State.copyMode = !State.copyMode;
+    el("properties-edit-btn").classList.toggle("active", State.copyMode);
+    document.querySelectorAll("#properties-list .properties-copy-btn").forEach((b) => {
+      b.style.visibility = State.copyMode ? "visible" : "hidden";
+    });
+    document.querySelectorAll("#properties-list .properties-edit-input").forEach((input) => {
+      input.disabled = !State.copyMode;
+    });
+    // обе карты должны узнать о смене режима сразу — от неё зависит, кликабельны ли
+    // капли (встроенная карта) и разрешено ли ставить точку кликом по фону (окно карты)
+    refreshMaps();
+  });
+  el("properties-map-btn").addEventListener("click", toggleEmbeddedMap);
+  el("properties-map-new-btn").addEventListener("click", toggleLocationMapWindow);
+  // сообщения из отдельного окна map.html: готовность к получению точек альбома, либо клик
+  // по карте, задающий геопривязку текущего фото
+  window.addEventListener("message", (e) => {
+    if (e.source !== State.mapWindow) return;
+    const data = e.data || {};
+    if (data.type === "map-ready") {
+      refreshMaps();
+      return;
+    }
+    if (typeof data.focusIndex === "number") {
+      goToPhoto(data.focusIndex);
+      return;
+    }
+    if (typeof data.lat === "number" && typeof data.lon === "number") setCurrentGeo(data.lat, data.lon);
+  });
+
   el("open-album-btn").addEventListener("click", pickAlbum);
-  el("refresh-album-btn").addEventListener("click", refreshAlbum);
-  el("up-dir-btn").addEventListener("click", navigateUp);
 
   el("rotate-slider").addEventListener("input", onRotateInput);
   el("rotate-toggle-btn").addEventListener("click", () => {
-    el("rotate-slider").hidden = !el("rotate-slider").hidden;
+    const slider = el("rotate-slider");
+    slider.hidden = !slider.hidden;
+    el("rotate-toggle-btn").classList.toggle("active", !slider.hidden);
+    // сетка помогает выставлять угол по линиям — включаем её вместе со слайдером поворота,
+    // как и при автогоризонте (см. autoDetectHorizon); выключать при скрытии слайдера не
+    // нужно — так же сетка не гасится сама нигде больше в редакторе
+    if (!slider.hidden) {
+      if (!State.showGrid) {
+        State.showGrid = true;
+        el("grid-btn").classList.add("active");
+      }
+      // открыли точную настройку угла — значит вот-вот появятся чёрные уголки по краям,
+      // рамку обрезки показываем заранее, а не только когда угол реально станет ненулевым
+      showCropFrame();
+      render();
+    }
   });
   el("rotate-value").addEventListener("click", () => {
     if (el("rotate-slider").disabled) return;
     el("rotate-slider").value = 0;
     onRotateInput({ target: el("rotate-slider") });
   });
-  el("reset-btn").addEventListener("click", resetFrame);
+  el("rotate-left-btn").addEventListener("click", () => rotateQuarter(-1));
+  el("rotate-right-btn").addEventListener("click", () => rotateQuarter(1));
+  el("flip-btn").addEventListener("click", flipHorizontal);
+  el("reset-btn").addEventListener("click", toggleCropFrame);
   el("grid-btn").addEventListener("click", toggleGrid);
   el("perspective-btn").addEventListener("click", togglePerspectiveMode);
   el("color-btn").addEventListener("click", toggleColorPicker);
@@ -1274,22 +2879,72 @@ function init() {
   el("prev-btn").addEventListener("click", prevPhoto);
   el("next-btn").addEventListener("click", nextPhoto);
   el("save-btn").addEventListener("click", saveCurrent);
+  el("slideshow-btn").addEventListener("click", toggleSlideshow);
+  el("fullscreen-btn").addEventListener("click", toggleFullscreenBtn);
+  el("toggle-left-btn").addEventListener("click", toggleLeftPanel);
+  el("toggle-bottom-btn").addEventListener("click", toggleBottomPanel);
+  el("toggle-right-btn").addEventListener("click", toggleRightPanel);
+  document.addEventListener("fullscreenchange", onFullscreenChange);
+  document.addEventListener("keydown", onViewerKeydown);
+  // настоящее изменение размера окна браузера (в т.ч. и то, которым сопровождается сам вход
+  // в fullscreen/выход из него — оно может занять больше кадра, поэтому это ещё и подстраховка
+  // для onFullscreenChange) — а не перетаскивание внутренних разделителей панелей: те двигают
+  // только свои элементы через inline-стили и это событие не поднимают, так что фотография
+  // по-прежнему не ужимается вживую при перетаскивании границ панелей
+  window.addEventListener("resize", () => fitPreviewToWindow());
 
   makeResizable(el("resizer-vertical"), el("left-column"), "x", {
     sign: 1, storageKey: "folderTreeWidth",
   });
-  makeResizable(el("resizer-properties"), el("folder-tree"), "y", {
-    sign: 1, storageKey: "folderTreeHeight",
-  });
   makeResizable(el("resizer-horizontal"), el("album-grid"), "y", {
-    sign: -1, storageKey: "albumGridHeight",
+    sign: -1, storageKey: "albumGridHeight", onResize: updateThumbSizing,
   });
+  makeResizable(el("resizer-right"), el("album-grid"), "x", {
+    sign: -1, min: 120, max: 2000, storageKey: "albumGridWidth", onResize: updateThumbSizing,
+  });
+  // ширина ленты (только что восстановленная выше из localStorage через storageKey) имеет
+  // смысл только в боковом режиме — в нижнем лента и так растягивается на всю ширину через
+  // flex, а унаследованный инлайн-стиль только мешал бы этому; и наоборот — сохранённая высота
+  // нижнего режима, если восстановились сразу в боковой (см. savedPanelMode выше), обрезала бы
+  // ленту по высоте прошлой сессии нижнего режима вместо того, чтобы растянуться на всю боковую
+  // панель — раньше это не всплывало, потому что toggleRightPanel() всегда сбрасывал высоту
+  // сам, а восстановление режима при старте идёт в обход него
+  if (document.body.classList.contains("panel-right")) {
+    el("album-grid").style.height = "";
+  } else {
+    el("album-grid").style.width = "";
+  }
+  updateThumbSizing();
 
   const c = canvas();
   c.addEventListener("pointerdown", onPointerDown);
   c.addEventListener("pointermove", onPointerMove);
   c.addEventListener("pointerup", onPointerUp);
   c.addEventListener("pointercancel", onPointerUp);
+  c.addEventListener("dblclick", enterFullscreen);
+
+  el("canvas-wrap").addEventListener("wheel", (evt) => {
+    if (!State.fullBitmap) return;
+    evt.preventDefault();
+    // в полноэкранном просмотре (и слайдшоу — он тот же fullscreen) колесо листает фото вместо зума
+    if (isFullscreenViewer()) {
+      const delta = Math.abs(evt.deltaX) > Math.abs(evt.deltaY) ? evt.deltaX : evt.deltaY;
+      if (delta > 0) nextPhoto(); else if (delta < 0) prevPhoto();
+      return;
+    }
+    setPreviewZoom(State.previewZoom * (evt.deltaY < 0 ? 1.1 : 1 / 1.1));
+  }, { passive: false });
+
+  el("album-grid").addEventListener("wheel", (evt) => {
+    if (evt.deltaY === 0) return;
+    evt.preventDefault();
+    const grid = el("album-grid");
+    if (document.body.classList.contains("panel-right")) {
+      grid.scrollTop += evt.deltaY;
+    } else {
+      grid.scrollLeft += evt.deltaY;
+    }
+  }, { passive: false });
 
   if (!window.showDirectoryPicker) {
     setStatus("status-bar", "Этот браузер не поддерживает File System Access API. Откройте страницу в Chrome или Edge.");

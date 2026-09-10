@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="icons/icon-32.png" sizes="32x32">
 <link rel="icon" href="icons/icon-192.png" sizes="192x192">
@@ -18,35 +19,70 @@
 <div id="app-body">
   <aside id="left-column">
     <div class="folder-toolbar">
-      <button id="up-dir-btn" title="Перейти на уровень выше" disabled><img src="icons/Folder UP WIT.png" alt=""></button>
       <button id="open-album-btn" title="Открыть альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
       <button id="continue-album-btn" hidden title="Продолжить последний альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
-      <button id="refresh-album-btn" hidden title="Обновить альбом"><img src="icons/Restore WIT.png" alt=""></button>
       <button id="settings-btn" title="О программе"><img src="icons/Gear WIT.png" alt=""></button>
     </div>
     <div id="folder-tree"></div>
-    <div id="resizer-properties" class="resizer resizer-horizontal" title="Потяните, чтобы изменить высоту панели параметров"></div>
     <div id="properties-panel">
-      <h3>Параметры</h3>
+      <div id="properties-heading">
+        <h3>Параметры</h3>
+        <span id="progress-label"></span>
+      </div>
       <dl id="properties-list"></dl>
-      <div id="properties-map" hidden>
-        <iframe id="properties-map-frame" title="Место съёмки" loading="lazy"></iframe>
+      <div id="properties-map-embed" class="properties-map-embed" hidden>
+        <div id="properties-map-embed-frame"></div>
+      </div>
+      <div id="properties-map-buttons" class="properties-map-buttons">
+        <button id="properties-map-btn" title="Показать карту" disabled><img src="icons/Map WIT.png" alt=""></button>
+        <button id="properties-map-new-btn" title="Показать карту в новом окне" disabled><img src="icons/Map Window WIT.png" alt=""></button>
+        <button id="properties-edit-btn" title="Режим редактирования параметров"><img src="icons/Edit WIT.png" alt=""></button>
       </div>
     </div>
   </aside>
   <div id="resizer-vertical" class="resizer resizer-vertical" title="Потяните, чтобы изменить ширину"></div>
 
   <main id="editor-pane">
-    <div id="canvas-wrap">
-      <canvas id="photo-canvas"></canvas>
+    <div class="folder-toolbar editor-topbar">
+      <p id="status-bar" class="status"></p>
+      <button id="toggle-left-btn" class="svg-icon-btn active" title="Показать/скрыть левую панель">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1.5" y="2" width="13" height="12" rx="1"/><rect x="1.5" y="2" width="5" height="12" fill="currentColor" stroke="none"/></svg>
+      </button>
+      <button id="toggle-bottom-btn" class="svg-icon-btn active" title="Показать/скрыть ленту фото">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1.5" y="2" width="13" height="12" rx="1"/><rect x="1.5" y="9" width="13" height="5" fill="currentColor" stroke="none"/></svg>
+      </button>
+      <button id="toggle-right-btn" class="svg-icon-btn" title="Переместить ленту фото вправо">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1.5" y="2" width="13" height="12" rx="1"/><rect x="9.5" y="2" width="5" height="12" fill="currentColor" stroke="none"/></svg>
+      </button>
+      <button id="fullscreen-btn" class="svg-icon-btn" title="Полный экран" disabled>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 5V1h4"/><path d="M11 1h4v4"/><path d="M1 11v4h4"/><path d="M15 11v4h-4"/></svg>
+      </button>
     </div>
 
-    <div id="resizer-horizontal" class="resizer resizer-horizontal" title="Потяните, чтобы изменить высоту ленты"></div>
+    <div id="canvas-row">
+      <div id="canvas-wrap">
+        <canvas id="photo-canvas"></canvas>
+        <canvas id="slideshow-fade-canvas"></canvas>
+        <audio id="slideshow-audio"></audio>
+      </div>
 
-    <aside id="album-grid"></aside>
+      <div id="resizer-horizontal" class="resizer resizer-horizontal" title="Потяните, чтобы изменить высоту ленты"></div>
+      <div id="resizer-right" class="resizer resizer-vertical" title="Потяните, чтобы изменить ширину ленты"></div>
+
+      <aside id="album-grid"></aside>
+    </div>
 
     <div class="toolbar">
-      <label class="aspect-control" title="Формат кадра">
+      <label class="rotate-control" title="Точная коррекция угла (выравнивание горизонта)">
+        <span id="rotate-value" title="Сбросить угол (0°)">0.0°</span>
+        <input type="range" id="rotate-slider" min="-90" max="90" step="0.1" value="0" disabled hidden>
+      </label>
+      <button id="rotate-toggle-btn" title="Показать/скрыть точную настройку угла" disabled><img src="icons/Вращение WIT.png" alt=""></button>
+      <button id="auto-horizon-btn" class="text-icon-btn" title="Автогоризонт: подбирать угол при открытии фото" disabled>⚖</button>
+      <button id="rotate-left-btn" class="text-icon-btn" title="Повернуть на 90° влево" disabled>↶</button>
+      <button id="rotate-right-btn" class="text-icon-btn" title="Повернуть на 90° вправо" disabled>↷</button>
+      <button id="flip-btn" class="text-icon-btn" title="Зеркальный разворот" disabled>⇋</button>
+      <label id="aspect-control" class="aspect-control" title="Формат кадра" hidden>
         <select id="aspect-select" disabled>
           <option value="9x16">9:16</option>
           <option value="4x5">4:5</option>
@@ -55,25 +91,19 @@
           <option value="16x9">16:9</option>
         </select>
       </label>
-      <label class="rotate-control" title="Выровнять горизонт">
-        ⚖
-        <input type="range" id="rotate-slider" min="-15" max="15" step="0.1" value="0" disabled>
-        <span id="rotate-value" title="Сбросить угол (0°)">0°</span>
-      </label>
-      <button id="rotate-toggle-btn" title="Показать/скрыть ползунок поворота" disabled><img src="icons/Вращение WIT.png" alt=""></button>
-      <button id="reset-btn" title="Сбросить рамку" disabled><img src="icons/Кадрирование WIT.png" alt=""></button>
+      <button id="reset-btn" title="Показать/скрыть рамку обрезки" disabled><img src="icons/Кадрирование WIT.png" alt=""></button>
       <button id="perspective-btn" title="Коррекция перспективы" disabled><img src="icons/Коррекция перспективы WIT.png" alt=""></button>
       <button id="grid-btn" title="Сетка" disabled><img src="icons/Lattice WIT.png" alt=""></button>
       <button id="color-btn" title="Цветокоррекция" disabled><img src="icons/Palette WIT.png" alt=""></button>
       <button id="restore-btn" title="Восстановить оригинал" disabled><img src="icons/Back WIT.png" alt=""></button>
       <button id="star-btn" title="Добавить в альбом" disabled><img src="icons/Star WIT.png" alt=""></button>
-      <span id="progress-label"></span>
+      <button id="slideshow-btn" class="svg-icon-btn" title="Слайдшоу (полный экран)" disabled>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1" y="2.5" width="14" height="11" rx="1.5"/><path d="M6.2 5.8v4.4l4.2-2.2z" fill="currentColor" stroke="none"/></svg>
+      </button>
       <button id="prev-btn" title="Предыдущее" disabled>◀</button>
       <button id="next-btn" title="Следующее" disabled>▶</button>
       <button id="save-btn" title="Сохранить" disabled><img src="icons/Save WIIT.png" alt=""></button>
     </div>
-
-    <p id="status-bar" class="status"></p>
   </main>
 </div>
 
@@ -96,7 +126,20 @@
   </div>
 </div>
 
+<div id="unsaved-modal" class="modal" hidden>
+  <div class="modal-content">
+    <p class="about-text" id="unsaved-modal-text"></p>
+    <div class="unsaved-modal-actions">
+      <button id="unsaved-save-btn" class="text-btn text-btn-primary">Сохранить и перейти</button>
+      <button id="unsaved-discard-btn" class="text-btn">Не сохранять</button>
+      <button id="unsaved-cancel-btn" class="text-btn">Отмена</button>
+    </div>
+  </div>
+</div>
+
 <script src="https://docs.opencv.org/4.9.0/opencv.js" async></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="geo-markers.js"></script>
 <script src="imaging.js"></script>
 <script src="vision.js"></script>
 <script src="exif.js"></script>
