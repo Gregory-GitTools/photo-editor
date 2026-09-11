@@ -4,6 +4,7 @@ const PREVIEW_MAX = 1000;
 const THUMB_MAX = 200;
 const HANDLE_VISUAL_CSS = 8; // видимый радиус ручки на экране (в CSS-пикселях, не в пикселях канваса)
 const HANDLE_HIT_CSS = 20; // радиус захвата ручки на экране — больше видимого, чтобы легче попадать
+const HANDLE_PAD = 24; // запас в px канваса вокруг предела перетаскивания угла перспективы, чтобы кружок ручки не обрезался ровно на границе
 const ASPECT_PRESETS = [
   { key: "9x16", w: 9, h: 16 },
   { key: "4x5", w: 4, h: 5 },
@@ -53,6 +54,9 @@ const State = {
   dragMode: null, // 'move' | 'resize' | 'perspective-corner'
   dragCorner: null, // 0..3
   dragStart: null,
+  // угол рамки обрезки (0..3, TL/TR/BR/BL), зафиксированный как неподвижный анкор на время
+  // текущего перетаскивания угла перспективы — см. fitCropRectToAnchor
+  perspectiveCropAnchor: null,
   dirty: false, // есть несохранённые правки текущего фото
   exifDirty: false, // отдельно: правки метаданных (дата/производитель/гео) — не сбрасываются авто-пересчётом dirty по кадру/углу
   netQuarterTurns: 0, // сумма поворотов на 90° по модулю 4 — если пользователь повернул и вернул обратно, кадр не считается изменённым
@@ -87,8 +91,19 @@ const ctx = () => canvas().getContext("2d");
 function setPreviewZoom(zoom) {
   State.previewZoom = Math.max(0.05, zoom);
   const c = canvas();
-  c.style.width = Math.round(State.previewW * State.previewZoom) + "px";
-  c.style.height = Math.round(State.previewH * State.previewZoom) + "px";
+  const margin = perspectiveCanvasMargin(State.previewW, State.previewH);
+  c.style.width = Math.round((State.previewW + margin.left + margin.right) * State.previewZoom) + "px";
+  c.style.height = Math.round((State.previewH + margin.top + margin.bottom) * State.previewZoom) + "px";
+}
+
+// когда включён режим перспективы, вокруг фото резервируется отступ в canvas — иначе холсту
+// физически негде нарисовать угол/линию, утянутые за пределы фото (см. onPointerMove, где
+// сам угол разрешено тянуть на ту же величину). Отступ фиксирован (не зависит от текущих
+// координат quad), чтобы не менять размер канваса на каждый pointermove во время перетаскивания.
+function perspectiveCanvasMargin(w, h) {
+  if (!State.perspectiveMode) return { left: 0, right: 0, top: 0, bottom: 0 };
+  const marginX = w * 1.5 + HANDLE_PAD, marginY = h * 1.5 + HANDLE_PAD;
+  return { left: marginX, right: marginX, top: marginY, bottom: marginY };
 }
 
 // растягивает фото на всё окно альбома (canvas-wrap) при открытии, без обрезки — масштаб
@@ -128,6 +143,12 @@ function fitPreviewToWindowInstant() {
 function applyFitToWindow() {
   const wrap = el("canvas-wrap");
   if (!State.previewW || !State.previewH || wrap.clientWidth === 0 || wrap.clientHeight === 0) return;
+  // масштаб считаем строго по размеру самого фото, а не по полному канвасу вместе с отступом
+  // под ручки перспективы (см. perspectiveCanvasMargin) — иначе с включённым режимом
+  // перспективы фото визуально резко уменьшалось бы, освобождая место под отступ, которым
+  // реально пользуются только во время активного перетаскивания угла. Сам канвас в CSS всё
+  // равно шире фото на этот отступ (см. setPreviewZoom) — лишнее просто уходит за край
+  // canvas-wrap (overflow: hidden), как и раньше уходило любое фото шире доступного окна
   setPreviewZoom(Math.min(wrap.clientWidth / State.previewW, wrap.clientHeight / State.previewH));
 }
 
@@ -1041,11 +1062,43 @@ function toggleAutoHorizon() {
   State.autoHorizonEnabled = !State.autoHorizonEnabled;
   localStorage.setItem(AUTO_HORIZON_STORAGE_KEY, State.autoHorizonEnabled ? "1" : "0");
   el("auto-horizon-btn").classList.toggle("active", State.autoHorizonEnabled);
-  // включили — сразу применяем к уже открытому фото, а не только при следующем открытии
-  if (State.autoHorizonEnabled && State.index >= 0) {
+  if (State.index < 0) return;
+  if (State.autoHorizonEnabled) {
+    // включили — сразу применяем к уже открытому фото, а не только при следующем открытии
     const myGen = ++State.loadGeneration;
     maybeAutoDetectHorizon(State.queue[State.index], myGen);
+  } else {
+    // выключили — угол, который был подобран автогоризонтом, тоже сбрасывается в 0
+    resetRotationAngle();
   }
+}
+
+// State.perspectiveQuad задаёт, куда должны деться 4 угла ТЕКУЩЕГО кадра (previewW×previewH) —
+// жёсткий поворот на 90° меняет сам кадр (а для 90°/270° ещё и переставляет местами его
+// ширину/высоту), поэтому уже заданную пользователем деформацию (в т.ч. с углами, утянутыми
+// за пределы фото — это осознанная правка дисторсии объектива, а не случайность) нужно
+// провернуть вместе с кадром, а не оставить как есть (числа будут отсчитаны от уже
+// несуществующей системы координат) и не сбросить в дефолт (тогда правка молча пропадёт)
+function rotateQuadQuarter(quad, w, h, quarterTurns) {
+  const q = ((quarterTurns % 4) + 4) % 4;
+  if (q === 0) return quad;
+  const transform = (pt) => {
+    if (q === 1) return { x: h - pt.y, y: pt.x };
+    if (q === 2) return { x: w - pt.x, y: h - pt.y };
+    return { x: pt.y, y: w - pt.x }; // q === 3
+  };
+  const out = new Array(4);
+  for (let i = 0; i < 4; i++) out[i] = transform(quad[(i - q + 4) % 4]);
+  return out;
+}
+
+// то же самое для зеркального отражения (см. flipBitmapHorizontal) — ширина/высота кадра не
+// меняются, но левая и правая половины меняются местами, поэтому и квад надо отразить, а не
+// просто переставить местами x-координаты внутри тех же самых 4 индексов
+function flipQuadHorizontal(quad, w) {
+  const transform = (pt) => ({ x: w - pt.x, y: pt.y });
+  const swapIdx = [1, 0, 3, 2];
+  return swapIdx.map((srcIdx) => transform(quad[srcIdx]));
 }
 
 // жёсткий поворот на 90°: quarterTurns 1 = по часовой, -1 = против часовой — впечатывается
@@ -1056,9 +1109,15 @@ async function rotateQuarter(quarterTurns) {
   // быстрый переход к другому фото) не дало этому, более старому и медленному вызову, переписать
   // состояние своими устаревшими результатами после того, как оно уже применит свои
   const myGen = ++State.loadGeneration;
+  // старые размеры кадра нужны до пересборки превью — именно в них ещё выражен текущий
+  // (дорисованный до поворота) State.perspectiveQuad
+  const oldW = State.previewW, oldH = State.previewH;
   State.fullBitmap = await createImageBitmap(rotateBitmapQuarter(State.fullBitmap, quarterTurns));
   await rebuildPreviewBitmap();
   if (myGen !== State.loadGeneration) return;
+  if (State.perspectiveQuad) {
+    State.perspectiveQuad = rotateQuadQuarter(State.perspectiveQuad, oldW, oldH, quarterTurns);
+  }
   // на 90°/270° ширина и высота превью меняются местами — CSS-размер canvas (задан в px,
   // см. setPreviewZoom) остаётся от старой, уже неверной пропорции, пока explicitly не
   // пересчитать его под новые previewW/previewH; иначе браузер растягивает новый кадр
@@ -1086,6 +1145,10 @@ async function flipHorizontal() {
   State.fullBitmap = await createImageBitmap(flipBitmapHorizontal(State.fullBitmap));
   await rebuildPreviewBitmap();
   if (myGen !== State.loadGeneration) return;
+  // ширина кадра при зеркале не меняется — можно отразить квад уже по новому previewW
+  if (State.perspectiveQuad) {
+    State.perspectiveQuad = flipQuadHorizontal(State.perspectiveQuad, State.previewW);
+  }
   // как и с поворотом — два разворота подряд возвращают исходные пиксели, поэтому
   // отслеживаем чётность, а не выставляем "грязно" безусловно
   State.netFlipped = !State.netFlipped;
@@ -1336,9 +1399,10 @@ function refreshEmbeddedMapMarkers() {
   } else {
     map.setView([20, 0], 2);
   }
-  // клик по капле переводит фокус на первое фото в группе; в режиме редактирования GPS
-  // важнее не мешать простановке точки, поэтому клики по каплям там не перехватываем
-  syncGeoMarkers(L, map, embeddedMarkersRef, State.albumGeo, State.index, State.copyMode ? null : (indexes) => goToPhoto(pickClusterTarget(indexes, State.index)));
+  // клик по капле переводит фокус на следующее фото в группе — как и в отдельном окне карты
+  // (map.html), это работает независимо от режима редактирования GPS: там точку по клику на
+  // саму каплю тоже не ставят, только по клику мимо капель (см. embeddedMap.on("click") выше)
+  syncGeoMarkers(L, map, embeddedMarkersRef, State.albumGeo, State.index, (indexes) => goToPhoto(pickClusterTarget(indexes, State.index)));
   requestAnimationFrame(() => map.invalidateSize());
 }
 
@@ -1410,14 +1474,17 @@ function resetCropRect() {
   // размеры именно новой картинки, а не то что осталось на canvas от предыдущего кадра;
   // учитываем и поворот, и (если активна) коррекцию перспективы — рамка вписывается в
   // истинно видимую область фото, а не только в её повёрнутый вариант, иначе сразу залезает
-  // в пустые (прозрачные/чёрные) зоны, оставленные любым из этих двух искажений
+  // в пустые (прозрачные/чёрные) зоны, оставленные любым из этих двух искажений. Дополнительно
+  // ограничена пределами самого фото [0,previewW]x[0,previewH] — угол квада можно утянуть
+  // далеко наружу, но и варп, и поворот при рендере всё равно обрезаны строго по этим границам
+  // (см. warpRectToQuad/drawRotatedAt), так что рамка не должна залезать за них тоже
   const quad = photoVisibleQuad(State.previewW, State.previewH, State.rotationDeg, State.perspectiveQuad);
-  State.cropRect = rectForAspectInQuad(quad, State.aspect.w, State.aspect.h);
+  State.cropRect = rectForAspectInQuad(quad, State.aspect.w, State.aspect.h, State.previewW, State.previewH);
 }
 
 function cropIsAtDefault() {
   const quad = photoVisibleQuad(State.previewW, State.previewH, State.rotationDeg, State.perspectiveQuad);
-  const base = rectForAspectInQuad(quad, State.aspect.w, State.aspect.h);
+  const base = rectForAspectInQuad(quad, State.aspect.w, State.aspect.h, State.previewW, State.previewH);
   const r = State.cropRect;
   const eps = 0.5;
   return Math.abs(r.x - base.x) < eps && Math.abs(r.y - base.y) < eps
@@ -1467,6 +1534,26 @@ function clampCropRectToCanvas(r, w, h) {
   r.h = Math.min(r.h, h);
   r.x = clamp(r.x, 0, w - r.w);
   r.y = clamp(r.y, 0, h - r.h);
+}
+
+// true, если все 4 угла рамки кадрирования лежат внутри quad (видимой области фото) и в
+// пределах [0,clipW]x[0,clipH] — используется, чтобы отличить "перспектива ушла наружу, рамка
+// всё ещё умещается" (её трогать не надо) от "перспектива ушла внутрь, рамка теперь торчит за
+// новую видимую границу" (её нужно уменьшить, см. onPointerMove/perspective-corner)
+function cropRectFitsQuad(r, quad, clipW, clipH) {
+  const eps = 0.5;
+  const corners = [
+    { x: r.x, y: r.y }, { x: r.x + r.w, y: r.y },
+    { x: r.x + r.w, y: r.y + r.h }, { x: r.x, y: r.y + r.h },
+  ];
+  const edges = quadEdges(quad);
+  for (const c of corners) {
+    if (c.x < -eps || c.x > clipW + eps || c.y < -eps || c.y > clipH + eps) return false;
+    for (const { v, e, sign } of edges) {
+      if ((e.x * (c.y - v.y) - e.y * (c.x - v.x)) * sign < -eps) return false;
+    }
+  }
+  return true;
 }
 
 // настоящая видимая (непрозрачная) граница фото на экране — учитывает ОБА фактора,
@@ -1555,12 +1642,14 @@ function clampMoveToQuad(x, y, rw, rh, quad) {
 // та же идея для растягивания за угол: анкорный (противоположный) угол рамки неподвижен
 // (и уже лежит внутри quad), размер растёт от него к курсору — для каждого ребра quad и
 // каждого из 3 движущихся углов рамки условие "остаться внутри" линейно по доле роста t,
-// берём наименьшую допустимую t по всем этим условиям сразу
-function clampResizeToQuad(anchor, rawW, rawH, signX, signY, quad) {
+// берём наименьшую допустимую t по всем этим условиям сразу. Принимает уже готовый список
+// рёбер (edges), а не сам quad — так его же можно переиспользовать и с добавленными рёбрами
+// клип-прямоугольника (см. fitCropRectToAnchor), не только с рёбрами одного четырёхугольника
+function clampResizeToEdges(anchor, rawW, rawH, signX, signY, edges) {
   if (rawW <= 0 || rawH <= 0) return { w: rawW, h: rawH };
   const movingCorners = [{ i: 1, j: 0 }, { i: 0, j: 1 }, { i: 1, j: 1 }];
   let maxT = 1;
-  for (const { v, e, sign } of quadEdges(quad)) {
+  for (const { v, e, sign } of edges) {
     const gAnchor = (e.x * (anchor.y - v.y) - e.y * (anchor.x - v.x)) * sign;
     for (const { i, j } of movingCorners) {
       const dx = i * signX * rawW, dy = j * signY * rawH;
@@ -1572,32 +1661,221 @@ function clampResizeToQuad(anchor, rawW, rawH, signX, signY, quad) {
   return { w: rawW * maxT, h: rawH * maxT };
 }
 
-// вписывает по центру наибольший прямоугольник заданного соотношения сторон в произвольный
-// выпуклый quad (видимую границу фото — см. photoVisibleQuad) — обобщение imaging.js'ного
-// rectForAspect (там центр совпадает с центром повёрнутого прямоугольника и есть готовая
-// тригонометрическая формула; здесь центр — центроид quad, а масштаб ищется тем же приёмом,
-// что и в clampResizeToQuad: углы прямоугольника линейны по коэффициенту роста s от центра,
-// поэтому каждое ребро quad даёт прямое, без итераций, условие на максимальное s)
-function rectForAspectInQuad(quad, aspectW, aspectH) {
+function clampResizeToQuad(anchor, rawW, rawH, signX, signY, quad) {
+  return clampResizeToEdges(anchor, rawW, rawH, signX, signY, quadEdges(quad));
+}
+
+// какой угол рамки обрезки держать неподвижным, если её край сейчас "поджимает" перспектива —
+// это угол, диагонально противоположный тому, что реально вылез за границу сильнее всего
+// (гарантированно дальше всего от места вторжения). Выбирать анкор так заново на КАЖДОМ кадре
+// перетаскивания небезопасно: как только рамка уже плотно вписана, margin у всех 4 углов
+// почти одинаково мал, и сравнение между ними — уже сравнение шума, из-за которого анкор
+// "перескакивал" с угла на угол и рамка со временем схлопывалась в случайном месте (см.
+// onPointerMove/perspective-corner — там анкор фиксируется один раз на весь жест перетаскивания)
+function pickCropShrinkAnchor(r, quad, clipW, clipH) {
+  const edges = cropQuadClipEdges(quad, clipW, clipH);
+  const corners = cropRectCorners(r);
+  const marginOf = (c) => {
+    let m = Infinity;
+    for (const { v, e, sign } of edges) {
+      const g = (e.x * (c.y - v.y) - e.y * (c.x - v.x)) * sign;
+      if (g < m) m = g;
+    }
+    return m;
+  };
+  let violIdx = 0, worstMargin = Infinity;
+  for (let i = 0; i < 4; i++) {
+    const m = marginOf(corners[i]);
+    if (m < worstMargin) { worstMargin = m; violIdx = i; }
+  }
+  return (violIdx + 2) % 4; // порядок corners — TL,TR,BR,BL: TL<->BR и TR<->BL
+}
+
+function cropQuadClipEdges(quad, clipW, clipH) {
+  let edges = quadEdges(quad);
+  if (clipW != null && clipH != null) {
+    const clipRect = [{ x: 0, y: 0 }, { x: clipW, y: 0 }, { x: clipW, y: clipH }, { x: 0, y: clipH }];
+    edges = edges.concat(quadEdges(clipRect));
+  }
+  return edges;
+}
+
+function cropRectCorners(r) {
+  return [
+    { x: r.x, y: r.y }, { x: r.x + r.w, y: r.y },
+    { x: r.x + r.w, y: r.y + r.h }, { x: r.x, y: r.y + r.h },
+  ];
+}
+
+// подгоняет рамку обрезки под текущий quad, держа неподвижным конкретный (уже выбранный,
+// см. pickCropShrinkAnchor) угол рамки — в отличие от pickCropShrinkAnchor, вызывается на
+// каждом кадре перетаскивания с одним и тем же anchorIdx, поэтому одинаково хорошо и сжимает
+// рамку (перспектива поджала сильнее), и растит её обратно (перспектива отпустила): в обоих
+// случаях считаем настоящий максимальный размер для этого анкора, а не только уменьшаем
+// текущий
+function fitCropRectToAnchor(r, quad, clipW, clipH, anchorIdx) {
+  const edges = cropQuadClipEdges(quad, clipW, clipH);
+  const corners = cropRectCorners(r);
+  // знак направления, в котором рамка простирается от анкорного угла (TL/TR/BR/BL) —
+  // противоположный (подвижный) угол лежит в сторону +signX/+signY от анкора
+  const signXFor = [1, -1, -1, 1], signYFor = [1, 1, -1, -1];
+  const anchor = corners[anchorIdx];
+  const signX = signXFor[anchorIdx], signY = signYFor[anchorIdx];
+  // clampResizeToEdges считает maxT не больше 1 (она сделана для живого перетаскивания ручки,
+  // где rawW/rawH — это предел, дальше которого сам курсор не тянет) — передав ей текущий
+  // r.w/r.h, мы бы разрешили только сжаться ещё сильнее и никогда не вырасти обратно, даже
+  // если анкор теперь допускает больший прямоугольник. Поэтому передаём заведомо большой
+  // размер той же пропорции — благодаря тому, что вся формула maxT линейна по rawW/rawH,
+  // результат (rawW*maxT) от масштаба этого "большого" размера не зависит и равен настоящему
+  // максимуму для данного анкора/направления
+  const ratio = r.w / r.h;
+  const bigW = (Math.max(clipW || 0, clipH || 0, r.w, r.h) + 1000) * 4;
+  const bigH = bigW / ratio;
+  const safe = clampResizeToEdges(anchor, bigW, bigH, signX, signY, edges);
+  r.w = safe.w;
+  r.h = safe.h;
+  r.x = signX > 0 ? anchor.x : anchor.x - safe.w;
+  r.y = signY > 0 ? anchor.y : anchor.y - safe.h;
+}
+
+// решает систему из трёх линейных уравнений A_i*x + B_i*y + C_i*z = -K_i (правило Крамера) —
+// нужна для поиска вершин многогранника ограничений в maxInscribedRectInEdges
+function solveLinear3(c1, c2, c3) {
+  const M = [[c1.A, c1.B, c1.C], [c2.A, c2.B, c2.C], [c3.A, c3.B, c3.C]];
+  const rhs = [-c1.K, -c2.K, -c3.K];
+  const det = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1])
+    - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+    + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+  if (Math.abs(det) < 1e-9) return null;
+  const detX = rhs[0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1])
+    - M[0][1] * (rhs[1] * M[2][2] - M[1][2] * rhs[2])
+    + M[0][2] * (rhs[1] * M[2][1] - M[1][1] * rhs[2]);
+  const detY = M[0][0] * (rhs[1] * M[2][2] - M[1][2] * rhs[2])
+    - rhs[0] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+    + M[0][2] * (M[1][0] * rhs[2] - rhs[1] * M[2][0]);
+  const detZ = M[0][0] * (M[1][1] * rhs[2] - rhs[1] * M[2][1])
+    - M[0][1] * (M[1][0] * rhs[2] - rhs[1] * M[2][0])
+    + rhs[0] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+  return { x: detX / det, y: detY / det, z: detZ / det };
+}
+
+// перебором троек ограничений { A, B, C, K } вида "A*x + B*y + C*z + K >= 0" находит вершину
+// многогранника, максимизирующую z — общий солвер линейной программы с 3 переменными,
+// используется и для поиска максимального размера рамки, и (со своим набором ограничений)
+// для последующего центрирования при уже найденном размере (см. maxInscribedRectInEdges)
+function solveLP3Max(constraints) {
+  const EPS = 1e-6;
+  let best = null;
+  const n = constraints.length;
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      for (let k = j + 1; k < n; k++) {
+        const sol = solveLinear3(constraints[i], constraints[j], constraints[k]);
+        if (!sol) continue;
+        let feasible = true;
+        for (let m = 0; m < n; m++) {
+          const c = constraints[m];
+          if (c.A * sol.x + c.B * sol.y + c.C * sol.z + c.K < -EPS) { feasible = false; break; }
+        }
+        if (feasible && (!best || sol.z > best.z)) best = sol;
+      }
+    }
+  }
+  return best;
+}
+
+// вписывает НАИБОЛЬШИЙ по площади прямоугольник заданного соотношения сторон в выпуклую
+// область, заданную списком полуплоскостей edges (обычно рёбра quad, при необходимости плюс
+// рёбра клип-прямоугольника — см. rectForAspectInQuad). Центр рамки (cx, cy) — тоже свободная
+// переменная наравне с размером: если сама область сильно несимметрична (сильная коррекция
+// перспективы), рамка, прибитая к центроиду области, может быть в разы меньше реально
+// помещающейся, просто сдвинутой в сторону свободного места.
+//
+// Максимальный размер часто достигается не в одной-единственной точке, а на целом отрезке/грани
+// (например, простой прямоугольник, чьи пропорции не совпадают ровно с 9:16, — высота уже
+// упёрлась в оба свои предела, а по ширине есть свободный ход в обе стороны). Первый проход
+// (максимизация s) при переборе вершин многогранника может как раз попасть в один из краёв
+// этого отрезка — рамку тогда прижмёт к углу, хотя вдоль одной из осей она могла бы стоять по
+// центру. Поэтому вторым проходом, уже при найденном максимальном s, вместо произвольной вершины
+// первого прохода ищем самую "центральную" точку — усредняем все вершины оставшейся (уже
+// двумерной, при зафиксированном s) области допустимых позиций (см. ниже).
+function maxInscribedRectInEdges(edges, aspectW, aspectH) {
   const ratio = aspectW / aspectH;
-  const cx = (quad[0].x + quad[1].x + quad[2].x + quad[3].x) / 4;
-  const cy = (quad[0].y + quad[1].y + quad[2].y + quad[3].y) / 4;
   const offsets = [
     { x: ratio, y: -1 }, { x: -ratio, y: -1 },
     { x: ratio, y: 1 }, { x: -ratio, y: 1 },
   ];
-  let maxS = Infinity;
-  for (const { v, e, sign } of quadEdges(quad)) {
-    const gCenter = (e.x * (cy - v.y) - e.y * (cx - v.x)) * sign;
+  // каждое ограничение — A*cx + B*cy + C*s + K >= 0
+  const constraints = [];
+  for (const { v, e, sign } of edges) {
+    const A = -e.y * sign, B = e.x * sign;
+    const K = sign * (e.y * v.x - e.x * v.y);
     for (const o of offsets) {
-      const slope = (e.x * o.y - e.y * o.x) * sign;
-      if (slope < 0) maxS = Math.min(maxS, gCenter / -slope);
+      const C = (e.x * o.y - e.y * o.x) * sign;
+      constraints.push({ A, B, C, K });
     }
   }
-  maxS = Math.max(0, maxS);
-  const h = 2 * maxS;
+  constraints.push({ A: 0, B: 0, C: 1, K: 0 }); // s >= 0
+
+  const stage1 = solveLP3Max(constraints);
+  if (!stage1 || stage1.z < -1e-6) return { x: 0, y: 0, w: 0, h: 0 }; // вырожденная (пустая) область
+  const sMax = Math.max(0, stage1.z);
+
+  // при зафиксированном sMax каждое ограничение "A*cx+B*cy+C*s+K>=0" превращается в плоское
+  // "A*cx+B*cy+(K+C*sMax)>=0" — область допустимых (cx,cy) теперь двумерна (обычно вырождена
+  // до отрезка или точки: как минимум одно направление уже "уперлось" в свой предел, раз s
+  // максимален). Берём просто среднее по всем вершинам ЭТОЙ области (пересечениям пар прямых,
+  // прошедшим проверку на допустимость) — для отрезка это его середина (то самое центрирование
+  // вдоль ещё свободного направления), для одной точки — она и есть, для настоящего
+  // многоугольника — среднее его вершин, тоже разумный, визуально центрированный выбор
+  // (не пытаемся максимизировать общий отступ по Чебышёву: если один из двух исходных
+  // размеров уже без запаса — как обычно и бывает при максимальном s, — общий минимальный
+  // отступ по всем ограничениям всё равно упрётся в 0, и такая "центровка" вырождается в тот
+  // же произвольный угол, что мы и чиним)
+  const posConstraints = [];
+  for (const c of constraints) {
+    const L = Math.hypot(c.A, c.B);
+    if (L < 1e-9) continue; // не зависит от cx,cy (это и есть само условие s>=0) — тут не участвует
+    posConstraints.push({ A: c.A, B: c.B, K: c.K + c.C * sMax });
+  }
+  const EPS = 1e-6;
+  let sumX = 0, sumY = 0, count = 0;
+  const n2 = posConstraints.length;
+  for (let i = 0; i < n2; i++) {
+    for (let j = i + 1; j < n2; j++) {
+      const a1 = posConstraints[i], a2 = posConstraints[j];
+      const det = a1.A * a2.B - a2.A * a1.B;
+      if (Math.abs(det) < 1e-9) continue;
+      const x = (-a1.K * a2.B + a2.K * a1.B) / det;
+      const y = (-a1.A * a2.K + a2.A * a1.K) / det;
+      let feasible = true;
+      for (const c of posConstraints) {
+        if (c.A * x + c.B * y + c.K < -EPS) { feasible = false; break; }
+      }
+      if (feasible) { sumX += x; sumY += y; count++; }
+    }
+  }
+  const cx = count > 0 ? sumX / count : stage1.x;
+  const cy = count > 0 ? sumY / count : stage1.y;
+
+  const h = 2 * sMax;
   const w = h * ratio;
   return { x: cx - w / 2, y: cy - h / 2, w, h };
+}
+
+// вписывает наибольший (по площади, а не только по центру) прямоугольник заданного соотношения
+// сторон в произвольный выпуклый quad (видимую границу фото — см. photoVisibleQuad).
+// clipW/clipH — необязательные доп. пределы (обычно previewW/previewH): рамка ограничена не
+// только рёбрами quad, но и этим прямоугольником, потому что сам рендер (варп/поворот) всегда
+// физически обрезан по [0,clipW]x[0,clipH] — угол quad можно утянуть далеко наружу, а видимые
+// (реально отрисованные) пиксели фото всё равно не выходят за эти границы
+function rectForAspectInQuad(quad, aspectW, aspectH, clipW, clipH) {
+  let edges = quadEdges(quad);
+  if (clipW != null && clipH != null) {
+    const clipRect = [{ x: 0, y: 0 }, { x: clipW, y: 0 }, { x: clipW, y: clipH }, { x: 0, y: clipH }];
+    edges = edges.concat(quadEdges(clipRect));
+  }
+  return maxInscribedRectInEdges(edges, aspectW, aspectH);
 }
 
 // схлопывает частые вызовы (например, при перетаскивании ползунка поворота) в один
@@ -1616,15 +1894,24 @@ function render() {
   const cctx = ctx();
   const w = State.previewW, h = State.previewH;
 
-  // canvas держим строго по размеру фото — менять его размер на каждый кадр (например, под
-  // отступ для ручек) дорого: это вызывает синхронный layout-reflow и на быстрых событиях
-  // (перетаскивание ползунка поворота) заметно подтормаживает сам слайдер.
-  // Вместо этого ручки рисуются с отступом внутрь (см. renderCropFrame/renderPerspectiveFrame).
-  if (c.width !== w) c.width = w;
-  if (c.height !== h) c.height = h;
+  // в режиме перспективы canvas расширяется на фиксированный отступ вокруг фото (см.
+  // perspectiveCanvasMargin) — иначе холсту физически негде рисовать углы/линии, утянутые за
+  // пределы фото. Отступ фиксирован и меняется только при входе/выходе из режима перспективы,
+  // повороте/зеркале или смене фото — не на каждый pointermove при перетаскивании.
+  const margin = perspectiveCanvasMargin(w, h);
+  const totalW = w + margin.left + margin.right;
+  const totalH = h + margin.top + margin.bottom;
+  if (c.width !== totalW) c.width = totalW;
+  if (c.height !== totalH) c.height = totalH;
   const scale = canvasScale();
 
   el("rotate-value").textContent = State.rotationDeg.toFixed(1) + "°";
+
+  cctx.fillStyle = "#0e0e10";
+  cctx.fillRect(0, 0, totalW, totalH);
+
+  cctx.save();
+  cctx.translate(margin.left, margin.top);
 
   cctx.fillStyle = "#000";
   cctx.fillRect(0, 0, w, h);
@@ -1642,6 +1929,8 @@ function render() {
 
   if (State.cropVisible) renderCropFrame(cctx, scale, w, h);
   if (State.perspectiveMode) renderPerspectiveFrame(cctx, scale, w, h);
+
+  cctx.restore();
 }
 
 function renderCropDarken(cctx, w, h) {
@@ -1677,18 +1966,6 @@ function insetIntoCanvas(x, y, r, w, h) {
   return [clamp(x, r, w - r), clamp(y, r, h - r)];
 }
 
-// угол перспективы можно утянуть далеко за пределы фото — если рисовать ручку в его
-// настоящей точке, она просто пропадает (canvas обрезает рисование по своим границам, а
-// там за кадром уже пусто), и её потом нечем зацепить обратно. В отличие от insetIntoCanvas
-// (рамка обрезки: круг целиком ВНУТРИ, с отступом от края на целый радиус), здесь центр
-// прижимаем ровно к самой границе канваса (без отступа) — круг оказывается ровно наполовину
-// снаружи фото, наполовину на виду, и визуально не сливается с отступающими вглубь ручками
-// рамки обрезки; а раз центр всегда строго в пределах [0,w]x[0,h], клик по нему всегда
-// попадает в сам canvas-элемент, и утянутую далеко ручку снова можно подцепить
-function outsetAtCanvasEdge(x, y, w, h) {
-  return [clamp(x, 0, w), clamp(y, 0, h)];
-}
-
 // печёт поворот (State.rotationDeg) в отдельный канвас нужного размера (как это делает
 // drawRotatedAt для основного render), а затем прогоняет его через настоящий проективный
 // варп — углы прямоугольника фото переходят в State.perspectiveQuad. Это и есть сама
@@ -1719,15 +1996,11 @@ function renderPerspectiveFrame(cctx, scale, w, h) {
 
   cctx.fillStyle = "#ffb020";
   const handleVisualR = HANDLE_VISUAL_CSS * scale;
-  // сама линия квада рисуется по настоящим точкам (в т.ч. за пределами канваса — так видна
-  // реальная деформация), а вот кружок-ручку там же нарисовать не получится: canvas обрезает
-  // отрисовку по своим границам, и утянутая далеко за кадр ручка попросту пропадает из виду.
-  // Поэтому кружок прижимаем к краю канваса снаружи (outsetAtCanvasEdge) — не внутрь, как
-  // ручки рамки обрезки, а именно наружу, чтобы не сливаться с ними визуально
+  // канвас теперь резервирует отступ вокруг фото (см. perspectiveCanvasMargin), так что
+  // ручку можно рисовать прямо в её настоящей точке, даже далеко за пределами фото
   for (const pt of q) {
-    const [cxp, cyp] = outsetAtCanvasEdge(pt.x, pt.y, w, h);
     cctx.beginPath();
-    cctx.arc(cxp, cyp, handleVisualR, 0, Math.PI * 2);
+    cctx.arc(pt.x, pt.y, handleVisualR, 0, Math.PI * 2);
     cctx.fill();
   }
 }
@@ -1785,7 +2058,10 @@ function cornerPoints(r) {
   ];
 }
 
-// координаты события в системе координат канваса; НЕ прижимаем их к границам канваса —
+// координаты события в системе координат ФОТО (0..previewW/0..previewH) — та же система, что
+// и у State.perspectiveQuad/State.cropRect. Канвас в режиме перспективы физически шире фото
+// на отступ (см. perspectiveCanvasMargin), поэтому отступ вычитается здесь же, один раз, а не
+// в каждом месте, которое читает координаты события. НЕ прижимаем их к границам фото —
 // перетаскивание угла коррекции перспективы должно уметь выходить за пределы фото (иначе
 // невозможно вытянуть угол наружу для устранения перспективных искажений), а рамка обрезки
 // сама клэмпится ниже, в onPointerMove, по месту
@@ -1794,9 +2070,10 @@ function canvasPointFromEvent(evt) {
   const rect = c.getBoundingClientRect();
   const scaleX = c.width / rect.width;
   const scaleY = c.height / rect.height;
+  const margin = perspectiveCanvasMargin(State.previewW, State.previewH);
   return {
-    x: (evt.clientX - rect.left) * scaleX,
-    y: (evt.clientY - rect.top) * scaleY,
+    x: (evt.clientX - rect.left) * scaleX - margin.left,
+    y: (evt.clientY - rect.top) * scaleY - margin.top,
   };
 }
 
@@ -1807,16 +2084,12 @@ function onPointerDown(evt) {
   // (у неё нет переноса всей рамки, только углы), и если промах — пробуем рамку обрезки
   if (State.perspectiveMode && State.perspectiveQuad) {
     const quad = State.perspectiveQuad;
-    const w = State.previewW, h = State.previewH;
     const scale = canvasScale();
     for (let i = 0; i < quad.length; i++) {
-      // попадание проверяем по видимой (прижатой к краю канваса) точке ручки — см.
-      // outsetAtCanvasEdge/renderPerspectiveFrame — а не по настоящему углу, иначе утянутую
-      // далеко за кадр ручку, которую и так еле видно, будет ещё и нечем подцепить обратно
-      const [hx, hy] = outsetAtCanvasEdge(quad[i].x, quad[i].y, w, h);
-      if (Math.hypot(p.x - hx, p.y - hy) <= HANDLE_HIT_CSS * scale) {
+      if (Math.hypot(p.x - quad[i].x, p.y - quad[i].y) <= HANDLE_HIT_CSS * scale) {
         State.dragMode = "perspective-corner";
         State.dragCorner = i;
+        State.perspectiveCropAnchor = null; // якорь рамки обрезки выбирается заново на новый жест
         canvas().setPointerCapture(evt.pointerId);
         return;
       }
@@ -1850,18 +2123,51 @@ function onPointerMove(evt) {
 
   if (State.dragMode === "perspective-corner") {
     // угол коррекции перспективы намеренно можно тянуть за пределы фото — именно это и
-    // создаёт нужную деформацию (устранение перспективных искажений), а не обрезку; предел —
-    // щедрый, но конечный отступ от канваса, чтобы не получить вырожденный четырёхугольник
-    const marginX = w * 0.6, marginY = h * 0.6;
+    // создаёт нужную деформацию (устранение перспективных искажений, в т.ч. сильных, широкоугольных),
+    // а не обрезку; предел — щедрый, но конечный отступ от канваса, чтобы не получить
+    // вырожденный (самопересекающийся) четырёхугольник
+    const marginX = w * 1.5, marginY = h * 1.5;
     State.perspectiveQuad[State.dragCorner] = {
       x: clamp(p.x, -marginX, w + marginX),
       y: clamp(p.y, -marginY, h + marginY),
     };
     if (!perspectiveIsAtDefault()) showCropFrame();
-    // деформация перспективой меняет саму видимую границу фото — рамка обрезки должна
-    // тут же вписаться в новую границу заново (как и при повороте, см. onRotateInput),
-    // иначе она рискует остаться там, где уже нет самого фото
-    if (State.cropVisible) resetCropRect();
+    // рамку обрезки трогаем, только если перспектива увела видимую область ВНУТРЬ настолько,
+    // что рамка перестала в неё помещаться — тогда её нужно ужать до максимально возможного
+    // размера (resetCropRect впишет её по новой видимой области), как и попросил Григорий.
+    // Если же угол потянули НАРУЖУ и рамка по-прежнему целиком внутри видимой области — её
+    // не трогаем вообще, она остаётся ровно там, где её оставил пользователь
+    if (State.cropRect) {
+      const visibleQuad = photoVisibleQuad(w, h, State.rotationDeg, State.perspectiveQuad);
+      // анкор (какой угол рамки неподвижен) выбирается один раз за весь жест — на первом кадре,
+      // где рамка перестала помещаться, — и дальше держится тем же все кадры подряд: так рамка
+      // может не только сжиматься (перспектива поджимает сильнее), но и расти обратно
+      // (перспектива отпускает), а не только в одну сторону (см. pickCropShrinkAnchor)
+      if (State.perspectiveCropAnchor == null && !cropRectFitsQuad(State.cropRect, visibleQuad, w, h)) {
+        State.perspectiveCropAnchor = pickCropShrinkAnchor(State.cropRect, visibleQuad, w, h);
+      }
+      if (State.perspectiveCropAnchor != null) {
+        fitCropRectToAnchor(State.cropRect, visibleQuad, w, h, State.perspectiveCropAnchor);
+        // fitCropRectToAnchor держит угол рамки, выбранный анкором ещё в начале жеста, как
+        // неподвижную точку отсчёта — вся её математика верна только пока эта точка сама лежит
+        // внутри видимой области. Когда перспектива меняется достаточно резко (например угол
+        // одной из сторон переходит через ноль и меняет знак наклона), сам анкор может выйти за
+        // новую границу — тогда результат получается уже не просто неоптимальным, а вообще
+        // недопустимым (торчит за пределы), причём иногда даже БОЛЬШИМ по размеру, чем настоящий
+        // максимум — поэтому сравнивать площади тут недостаточно, нужно явно проверять
+        // геометрическую годность результата. В этом случае просто пересчитываем рамку заново
+        // тем же способом, что и сброс (rectForAspectInQuad), и отпускаем анкор — он подберётся
+        // заново, когда/если рамка в следующий раз перестанет помещаться
+        if (!cropRectFitsQuad(State.cropRect, visibleQuad, w, h)) {
+          const best = rectForAspectInQuad(visibleQuad, State.aspect.w, State.aspect.h, w, h);
+          State.cropRect.x = best.x;
+          State.cropRect.y = best.y;
+          State.cropRect.w = best.w;
+          State.cropRect.h = best.h;
+          State.perspectiveCropAnchor = null;
+        }
+      }
+    }
     refreshDirty();
     requestRender();
     return;
@@ -1928,6 +2234,7 @@ function onPointerUp(evt) {
     refreshDirty();
   }
   State.dragMode = null;
+  State.perspectiveCropAnchor = null;
   try { canvas().releasePointerCapture(evt.pointerId); } catch (_) {}
 }
 
@@ -2137,12 +2444,14 @@ function syncCropFrameUI() {
   el("aspect-control").hidden = !State.cropVisible;
 }
 
-// рамка обрезки скрыта по умолчанию — эта кнопка включает/выключает её показ; при включении
-// заодно сбрасывает рамку на формат по умолчанию (раньше это был единственный смысл кнопки)
+// рамка обрезки скрыта по умолчанию — эта кнопка включает/выключает её показ; сбрасывает
+// рамку на формат по умолчанию в обе стороны (и при включении, и при выключении) — иначе
+// после ручной правки рамки, скрытой и показанной заново, оставалось бы старое положение,
+// которое пользователь уже не видел и не ожидает найти
 function toggleCropFrame() {
   State.cropVisible = !State.cropVisible;
   syncCropFrameUI();
-  if (State.cropVisible) resetCropRect();
+  resetCropRect();
   refreshDirty();
   render();
 }
@@ -2532,6 +2841,17 @@ function findGridNeighbor(current, key) {
   return items[idx + (key === "ArrowLeft" ? -1 : 1)] || null;
 }
 
+// сброс угла в 0 без статус-сообщения "задан вручную" (в отличие от onRotateInput) — используется,
+// когда угол сбрасывается автоматически (скрыли ползунок точной настройки, выключили автогоризонт),
+// а не пользователем через сам ползунок
+function resetRotationAngle() {
+  State.rotationDeg = 0;
+  el("rotate-slider").value = 0;
+  resetCropRect();
+  refreshDirty();
+  requestRender();
+}
+
 function onRotateInput(evt) {
   State.rotationDeg = parseFloat(evt.target.value);
   // пользователь сам поправил угол вручную — сообщение об ошибке автогоризонта (не нашёл
@@ -2580,7 +2900,7 @@ function toggleGrid() {
 function togglePerspectiveMode() {
   State.perspectiveMode = !State.perspectiveMode;
   el("perspective-btn").classList.toggle("active", State.perspectiveMode);
-  if (State.perspectiveMode && !State.perspectiveQuad) {
+  if (State.perspectiveMode) {
     // рамку перспективы стартуем от истинных краёв фото (а не от узкой рамки обрезки под
     // выбранный формат) — коррекцию перспективы обычно делают на всём кадре, до кропа
     const w = State.previewW, h = State.previewH;
@@ -2590,8 +2910,25 @@ function togglePerspectiveMode() {
       { x: w, y: h },
       { x: 0, y: h },
     ];
+  } else {
+    // выключили режим — сама правка (утянутые углы) тоже сбрасывается, а не просто прячется;
+    // при следующем включении квад стартует заново от истинных краёв фото (см. выше)
+    State.perspectiveQuad = null;
   }
+  // рамку обрезки включение/выключение перспективы не трогает (см. onPointerMove) — она
+  // остаётся там, где её оставил пользователь
   refreshDirty();
+  // канвас при входе/выходе из режима перспективы резко меняет размер (появляется/пропадает
+  // отступ под ручки, см. perspectiveCanvasMargin) — это не плавная подстройка под окно (как при
+  // ресайзе браузера), а мгновенная смена режима, поэтому и вписываем в окно без CSS-анимации
+  // (см. fitPreviewToWindowInstant/loadPhoto) — иначе на время transition канвас с уже
+  // перерисованным (новым) содержимым пришлось бы силой втискивать в старый CSS-размер, и
+  // фото на глазах "сплющивалось/растягивалось" все 0.2с анимации.
+  // Важно сделать это ДО render(): canvasScale() (радиус ручек) считает соотношение
+  // canvas.width к реальному CSS-размеру на экране — если сначала отрисовать (новый большой
+  // canvas.width), а CSS-размер ещё старый (маленький, без отступа), ручки на один кадр
+  // получаются в разы крупнее нормального
+  fitPreviewToWindowInstant();
   render();
 }
 
@@ -2860,6 +3197,9 @@ function init() {
       // рамку обрезки показываем заранее, а не только когда угол реально станет ненулевым
       showCropFrame();
       render();
+    } else {
+      // закрыли точную настройку угла — сама правка тоже сбрасывается, а не просто прячется
+      resetRotationAngle();
     }
   });
   el("rotate-value").addEventListener("click", () => {
