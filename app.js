@@ -57,6 +57,12 @@ const State = {
   // угол рамки обрезки (0..3, TL/TR/BR/BL), зафиксированный как неподвижный анкор на время
   // текущего перетаскивания угла перспективы — см. fitCropRectToAnchor
   perspectiveCropAnchor: null,
+  // true, если на начало текущего перетаскивания угла перспективы рамка обрезки была в
+  // положении "по умолчанию" (см. cropIsAtDefault) — тогда её не за что бережно держать, и
+  // она вместо anchor-логики просто каждый кадр пересчитывается заново как максимально
+  // вписанная (см. onPointerMove/perspective-corner) — иначе при освобождении места
+  // перспективой рамка так и оставалась бы в старом, уже не максимальном размере
+  perspectiveCropTrackMax: false,
   dirty: false, // есть несохранённые правки текущего фото
   exifDirty: false, // отдельно: правки метаданных (дата/производитель/гео) — не сбрасываются авто-пересчётом dirty по кадру/углу
   netQuarterTurns: 0, // сумма поворотов на 90° по модулю 4 — если пользователь повернул и вернул обратно, кадр не считается изменённым
@@ -2132,6 +2138,8 @@ function onPointerDown(evt) {
         State.dragMode = "perspective-corner";
         State.dragCorner = i;
         State.perspectiveCropAnchor = null; // якорь рамки обрезки выбирается заново на новый жест
+        // рамка ещё нигде вручную не подвинута — весь этот жест держим её максимально вписанной
+        State.perspectiveCropTrackMax = !State.cropRect || cropIsAtDefault();
         canvas().setPointerCapture(evt.pointerId);
         return;
       }
@@ -2179,39 +2187,54 @@ function onPointerMove(evt) {
     // пор, пока пользователь не пересоздаст её вручную (см. isConvexQuad)
     State.perspectiveQuad[State.dragCorner] = clampCornerToConvexQuad(State.perspectiveQuad, State.dragCorner, candidate);
     if (!perspectiveIsAtDefault()) showCropFrame();
-    // рамку обрезки трогаем, только если перспектива увела видимую область ВНУТРЬ настолько,
-    // что рамка перестала в неё помещаться — тогда её нужно ужать до максимально возможного
-    // размера (resetCropRect впишет её по новой видимой области), как и попросил Григорий.
-    // Если же угол потянули НАРУЖУ и рамка по-прежнему целиком внутри видимой области — её
-    // не трогаем вообще, она остаётся ровно там, где её оставил пользователь
     if (State.cropRect) {
       const visibleQuad = photoVisibleQuad(w, h, State.rotationDeg, State.perspectiveQuad);
-      // анкор (какой угол рамки неподвижен) выбирается один раз за весь жест — на первом кадре,
-      // где рамка перестала помещаться, — и дальше держится тем же все кадры подряд: так рамка
-      // может не только сжиматься (перспектива поджимает сильнее), но и расти обратно
-      // (перспектива отпускает), а не только в одну сторону (см. pickCropShrinkAnchor)
-      if (State.perspectiveCropAnchor == null && !cropRectFitsQuad(State.cropRect, visibleQuad, w, h)) {
-        State.perspectiveCropAnchor = pickCropShrinkAnchor(State.cropRect, visibleQuad, w, h);
-      }
-      if (State.perspectiveCropAnchor != null) {
-        fitCropRectToAnchor(State.cropRect, visibleQuad, w, h, State.perspectiveCropAnchor);
-        // fitCropRectToAnchor держит угол рамки, выбранный анкором ещё в начале жеста, как
-        // неподвижную точку отсчёта — вся её математика верна только пока эта точка сама лежит
-        // внутри видимой области. Когда перспектива меняется достаточно резко (например угол
-        // одной из сторон переходит через ноль и меняет знак наклона), сам анкор может выйти за
-        // новую границу — тогда результат получается уже не просто неоптимальным, а вообще
-        // недопустимым (торчит за пределы), причём иногда даже БОЛЬШИМ по размеру, чем настоящий
-        // максимум — поэтому сравнивать площади тут недостаточно, нужно явно проверять
-        // геометрическую годность результата. В этом случае просто пересчитываем рамку заново
-        // тем же способом, что и сброс (rectForAspectInQuad), и отпускаем анкор — он подберётся
-        // заново, когда/если рамка в следующий раз перестанет помещаться
-        if (!cropRectFitsQuad(State.cropRect, visibleQuad, w, h)) {
-          const best = rectForAspectInQuad(visibleQuad, State.aspect.w, State.aspect.h, w, h);
-          State.cropRect.x = best.x;
-          State.cropRect.y = best.y;
-          State.cropRect.w = best.w;
-          State.cropRect.h = best.h;
-          State.perspectiveCropAnchor = null;
+      if (State.perspectiveCropTrackMax) {
+        // рамка на начало этого жеста была в положении "по умолчанию" (максимально вписана) —
+        // значит нет никакой ручной правки, которую нужно бережно сохранять от кадра к кадру,
+        // и рамку просто держим равной настоящему максимуму на каждом кадре: тогда она
+        // одинаково естественно и сжимается, когда перспектива поджимает, и растёт обратно,
+        // когда место освобождается (в т.ч. сразу с самого начала жеста, а не только после
+        // того, как её один раз пришлось ужать)
+        const best = rectForAspectInQuad(visibleQuad, State.aspect.w, State.aspect.h, w, h);
+        State.cropRect.x = best.x;
+        State.cropRect.y = best.y;
+        State.cropRect.w = best.w;
+        State.cropRect.h = best.h;
+      } else {
+        // рамку обрезки трогаем, только если перспектива увела видимую область ВНУТРЬ настолько,
+        // что рамка перестала в неё помещаться — тогда её нужно ужать до максимально возможного
+        // размера. Если же угол потянули НАРУЖУ и рамка по-прежнему целиком внутри видимой
+        // области — её не трогаем вообще, она остаётся ровно там, где её оставил пользователь
+        // (эта ветка — только для рамки, уже вручную подвинутой/подрезанной пользователем, см.
+        // perspectiveCropTrackMax)
+        // анкор (какой угол рамки неподвижен) выбирается один раз за весь жест — на первом кадре,
+        // где рамка перестала помещаться, — и дальше держится тем же все кадры подряд: так рамка
+        // может не только сжиматься (перспектива поджимает сильнее), но и расти обратно
+        // (перспектива отпускает), а не только в одну сторону (см. pickCropShrinkAnchor)
+        if (State.perspectiveCropAnchor == null && !cropRectFitsQuad(State.cropRect, visibleQuad, w, h)) {
+          State.perspectiveCropAnchor = pickCropShrinkAnchor(State.cropRect, visibleQuad, w, h);
+        }
+        if (State.perspectiveCropAnchor != null) {
+          fitCropRectToAnchor(State.cropRect, visibleQuad, w, h, State.perspectiveCropAnchor);
+          // fitCropRectToAnchor держит угол рамки, выбранный анкором ещё в начале жеста, как
+          // неподвижную точку отсчёта — вся её математика верна только пока эта точка сама лежит
+          // внутри видимой области. Когда перспектива меняется достаточно резко (например угол
+          // одной из сторон переходит через ноль и меняет знак наклона), сам анкор может выйти за
+          // новую границу — тогда результат получается уже не просто неоптимальным, а вообще
+          // недопустимым (торчит за пределы), причём иногда даже БОЛЬШИМ по размеру, чем настоящий
+          // максимум — поэтому сравнивать площади тут недостаточно, нужно явно проверять
+          // геометрическую годность результата. В этом случае просто пересчитываем рамку заново
+          // тем же способом, что и сброс (rectForAspectInQuad), и отпускаем анкор — он подберётся
+          // заново, когда/если рамка в следующий раз перестанет помещаться
+          if (!cropRectFitsQuad(State.cropRect, visibleQuad, w, h)) {
+            const best = rectForAspectInQuad(visibleQuad, State.aspect.w, State.aspect.h, w, h);
+            State.cropRect.x = best.x;
+            State.cropRect.y = best.y;
+            State.cropRect.w = best.w;
+            State.cropRect.h = best.h;
+            State.perspectiveCropAnchor = null;
+          }
         }
       }
     }
