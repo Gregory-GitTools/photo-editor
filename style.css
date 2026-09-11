@@ -440,7 +440,7 @@ body.panel-right #canvas-row {
   height: min(660px, 60vmin);
   object-fit: contain;
   border-radius: 24px;
-  opacity: 0.55;
+  opacity: 0.275;
 }
 
 /* снимок предыдущего кадра слайдшоу, наложенный поверх основного канваса — плавно растворяется
@@ -756,20 +756,16 @@ body.panel-right #album-grid.color-picker-mode {
   color: var(--muted);
   font-size: 0.8rem;
   line-height: 1.5;
-  margin: 0;
+  margin: 0 0 16px;
 }
 
 .modal-content a { color: var(--accent); text-decoration: none; }
 .modal-content a:hover { text-decoration: underline; }
 
-.about-install {
-  margin-top: 16px;
-}
-
-.about-install-hint {
+#about-modal .about-install-hint {
   color: var(--muted);
   font-size: 0.8rem;
-  margin: 8px 0 0;
+  margin: 0 0 12px;
 }
 
 .about-install-hint code {
@@ -778,6 +774,19 @@ body.panel-right #album-grid.color-picker-mode {
   border: 1px solid #3a3a42;
   border-radius: 4px;
   padding: 1px 5px;
+}
+
+.about-install-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.about-install-btn img {
+  width: 18px;
+  height: 18px;
 }
 
 .unsaved-modal-actions {
