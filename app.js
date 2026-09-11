@@ -18,7 +18,7 @@ const PANEL_MODE_STORAGE_KEY = "albumPanelMode";
 // если детектор нашёл "уверенную" линию, но угол больше этого — почти наверняка за горизонт
 // приняли что-то другое (кромку предмета, диагональ переднего плана), лучше пропустить как ошибку
 const AUTO_HORIZON_MAX_ANGLE = 5;
-const ORIGINALS_DIR = ".Originals";
+const ORIGINALS_DIR = "[Originals]";
 const ALBUM_SUFFIX = "-Albom";
 
 const COLOR_VARIANTS = [
@@ -38,6 +38,7 @@ const State = {
   folderExpanders: new Map(), // handle -> loadChildren() этого узла, чтобы дойти до вложенной папки программно
   folderChildren: new Map(), // handle -> актуальный список дочерних handle'ов узла после последней подгрузки
   treeBuildPromise: null, // промис текущей buildFolderTree — чтобы дождаться дерева перед восстановлением фокуса
+  treeGeneration: 0, // счётчик построений дерева — если пока строилось старое, запустили новое, старое не должно дописать свой корень поверх актуального
   albumGeneration: 0, // счётчик открытий альбома — чтобы фоновая генерация миниатюр прошлого альбома не писала в чужую сетку
   albumHandle: null,
   originalsHandle: null, // создаётся лениво, только при первом сохранении
@@ -242,7 +243,7 @@ function freezeEditingControls(frozen) {
   }
 }
 
-// подпапки текущей папки для дерева слева — скрываем только служебную ".Originals";
+// подпапки текущей папки для дерева слева — скрываем только служебную ORIGINALS_DIR;
 // curated-подпапки "<имя>-Albom" в дереве не прячем — это тоже альбомы, их наличие должно быть видно
 async function listSubdirectories(dirHandle) {
   const dirs = [];
@@ -253,6 +254,24 @@ async function listSubdirectories(dirHandle) {
   }
   dirs.sort((a, b) => a.name.localeCompare(b.name));
   return dirs;
+}
+
+// File System Access API не умеет переименовывать/перемещать ПАПКИ напрямую (FileSystemHandle.move()
+// поддерживает только файлы) — поэтому "переименование" папки имитируется копированием всего
+// содержимого под новым именем с последующим удалением оригинала (см. startFolderRename ниже)
+async function copyDirectoryRecursive(srcDirHandle, destParentHandle, destName) {
+  const destDirHandle = await destParentHandle.getDirectoryHandle(destName, { create: true });
+  for await (const entry of srcDirHandle.values()) {
+    if (entry.kind === "file") {
+      const file = await entry.getFile();
+      const destFileHandle = await destDirHandle.getFileHandle(entry.name, { create: true });
+      const writable = await destFileHandle.createWritable();
+      await writable.write(file);
+      await writable.close();
+    } else {
+      await copyDirectoryRecursive(entry, destDirHandle, entry.name);
+    }
+  }
 }
 
 async function createFolderNode(handle, opts = {}) {
@@ -281,14 +300,21 @@ async function createFolderNode(handle, opts = {}) {
   let loaded = false;
 
   // содержимое узла подгружается лениво — только когда его раскрывают стрелкой (или это
-  // корень дерева). Пересканирует подпапки заново при каждом раскрытии, так что свежесозданные/
-  // удалённые папки на диске подтягиваются, не пересобирая всё дерево целиком.
+  // корень дерева). Пересканирует подпапки заново при КАЖДОМ раскрытии (а не только при первом),
+  // так что свежесозданные/удалённые/переименованные папки на диске подтягиваются каждый раз —
+  // раньше при повторном раскрытии уже виденного узла просто показывался старый childList
   async function loadChildren() {
     const subdirs = await listSubdirectories(handle);
     State.folderChildren.set(handle, subdirs);
-    toggle.textContent = subdirs.length ? "▾" : "";
     loaded = true;
-    if (subdirs.length === 0) return; // у листа нет смысла создавать пустой childList
+    if (subdirs.length === 0) {
+      // подпапки исчезли (были удалены/переименованы с прошлого раза) — прячем и стрелку, и
+      // старый childList целиком, а не оставляем его висеть с уже не существующими записями
+      toggle.textContent = "";
+      if (childList) childList.hidden = true;
+      return;
+    }
+    toggle.textContent = "▾";
     if (!childList) {
       childList = document.createElement("ul");
       childList.className = "folder-tree-list";
@@ -307,19 +333,28 @@ async function createFolderNode(handle, opts = {}) {
 
   toggle.addEventListener("click", async (evt) => {
     evt.stopPropagation();
-    if (initialSubdirs.length === 0 && !loaded) return;
-    if (!loaded) {
-      await loadChildren();
+    if (loaded && childList && !childList.hidden) {
+      // уже раскрыт — просто сворачиваем; пересканировать диск имеет смысл только на раскрытие
+      childList.hidden = true;
+      toggle.textContent = "▸";
       return;
     }
-    childList.hidden = !childList.hidden;
-    toggle.textContent = childList.hidden ? "▸" : "▾";
+    if (initialSubdirs.length === 0 && !loaded) return; // при создании узла подпапок не было и мы их ещё не проверяли повторно — реагировать не на что
+    await loadChildren(); // раскрытие — всегда свежее пересканирование (см. loadChildren)
   });
 
+  // и открытие альбома по имени, и переименование папки по её имени — активируются одним и тем
+  // же кликом по name, различаются только тем, была ли эта строка уже выбрана (см. ниже)
   name.addEventListener("click", async (evt) => {
-    if (evt.detail > 1) return; // часть двойного клика — открытие в Проводнике, см. ниже
+    if (evt.detail > 1) return; // часть быстрого двойного клика — открытие в Проводнике, см. ниже
+    if (row.classList.contains("active")) {
+      // повторный (неспешный, не засчитанный браузером как двойной клик) клик по уже открытой
+      // папке — это жест переименования, а не повторное открытие того же альбома
+      startFolderRename();
+      return;
+    }
     highlightFolderRow(row);
-    if (!loaded) await loadChildren(); // сразу показываем вложенные папки открываемого альбома, не только по клику на стрелку
+    await loadChildren(); // всегда пересканируем — структура могла измениться с прошлого раза (а не только если !loaded)
     await openAlbum(handle);
     // путь запоминаем только по реальному клику в дереве — так восстановление фокуса
     // (которое само открывает альбомы программно) не перетирает его неполным путём
@@ -334,9 +369,114 @@ async function createFolderNode(handle, opts = {}) {
   // для открытия в Проводнике путь строится из имён (folderNamePath) поверх абсолютного пути
   // корня, который пользователя просят указать один раз (см. ensureRootAbsolutePath)
   row.addEventListener("dblclick", (evt) => {
+    if (name.querySelector("input")) return; // идёт переименование — двойной клик тут для выделения слова в поле, не для Проводника
     evt.preventDefault();
     openFolderInExplorer(handle);
   });
+
+  // переименование папки на диске — вход тем же кликом, что и открытие (см. name click выше),
+  // если папка уже была выбрана. Использует FileSystemHandle.move() — переименование "на месте",
+  // без пересоздания handle (тот же handle продолжает указывать на ту же папку под новым именем),
+  // поэтому все Map'ы дерева (folderParents/folderRows/...), ключ которых — сам handle, остаются верны
+  function startFolderRename() {
+    if (name.querySelector("input")) return; // уже редактируем
+    const originalName = handle.name;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "folder-rename-input";
+    input.value = originalName;
+    name.textContent = "";
+    name.appendChild(input);
+    input.focus();
+    input.select();
+    // клики/двойные клики внутри самого поля — это работа с текстом (выделение слова и т.п.),
+    // а не новый жест выбора/открытия/переименования строки дерева
+    input.addEventListener("click", (evt) => evt.stopPropagation());
+    input.addEventListener("dblclick", (evt) => evt.stopPropagation());
+    input.addEventListener("mousedown", (evt) => evt.stopPropagation());
+
+    let settled = false;
+    const finish = async (commit) => {
+      if (settled) return;
+      settled = true;
+      const newName = input.value.trim();
+      if (!commit || !newName || newName === originalName) {
+        name.textContent = handle.name;
+        name.title = handle.name;
+        return;
+      }
+      const nativeMoveSupported = typeof handle.move === "function"; // браузеры пока не поддерживают move() для папок (только для файлов) — на практике всегда false для директорий, но проверяем на случай, если это изменится
+      const parent = State.folderParents.get(handle);
+      if (!nativeMoveSupported && !parent) {
+        // это корень дерева: браузер не умеет переименовывать папки напрямую, а обходной путь
+        // (скопировать содержимое под новым именем и удалить старую папку) требует доступа к
+        // РОДИТЕЛЮ переименовываемой папки — а до родителя корня у File System Access API вообще
+        // нет способа добраться (нет метода "подняться на уровень выше" от выданного handle'а)
+        setStatus("status-bar", "Корневую папку дерева нельзя переименовать через приложение (нет доступа к папке-родителю). Переименуйте её в Проводнике Windows (двойной клик по строке откроет её там) и откройте альбом заново.");
+        name.textContent = originalName;
+        name.title = originalName;
+        return;
+      }
+      try {
+        let resultHandle = handle;
+        if (nativeMoveSupported) {
+          await handle.move(newName);
+        } else {
+          // обходной путь: скопировать всё содержимое папки под новым именем, затем удалить
+          // оригинал. Если копирование прервётся ошибкой на середине — удаляем недоделанную
+          // копию и не трогаем оригинал, чтобы не оставить папку-дубль с частью файлов
+          setStatus("status-bar", `Переименование «${originalName}» → «${newName}»: копируем содержимое папки (браузер не умеет переименовывать папки напрямую)…`);
+          try {
+            await copyDirectoryRecursive(handle, parent, newName);
+          } catch (copyErr) {
+            try { await parent.removeEntry(newName, { recursive: true }); } catch (_) {}
+            throw copyErr;
+          }
+          await parent.removeEntry(originalName, { recursive: true });
+          // старый handle теперь указывает на удалённую папку — пересканируем родителя, чтобы
+          // получить свежий handle новой папки и обновить весь поддерево в дереве слева
+          const refresh = State.folderExpanders.get(parent);
+          if (refresh) await refresh();
+          const siblings = State.folderChildren.get(parent) || [];
+          resultHandle = siblings.find((h) => h.name === newName) || null;
+        }
+
+        if (!resultHandle) {
+          setStatus("status-bar", `Папка переименована в «${newName}», но не удалось обновить дерево слева — перезагрузите страницу.`);
+          return;
+        }
+
+        if (nativeMoveSupported) {
+          name.textContent = resultHandle.name;
+          name.title = resultHandle.name;
+        }
+        const row = State.folderRows.get(resultHandle);
+        if (row) highlightFolderRow(row);
+        setStatus("status-bar", `Папка переименована: «${resultHandle.name}».`);
+
+        // сохранённые пути/кэши хранят папку как handle или как путь имён — обновляем их на
+        // случай, если переименовали корень дерева или сам текущий открытый альбом
+        if (State.rootHandle === handle) {
+          State.rootHandle = resultHandle;
+          try { await idbSet("lastRoot", resultHandle); } catch (_) {}
+        }
+        if (State.albumHandle === handle) {
+          try { await idbSet("lastFocusedPath", folderNamePath(resultHandle)); } catch (_) {}
+          if (!nativeMoveSupported) await openAlbum(resultHandle); // старый handle недействителен — переоткрываем альбом на свежем
+        }
+      } catch (e) {
+        name.textContent = originalName;
+        name.title = originalName;
+        setStatus("status-bar", "Не удалось переименовать папку: " + e.message);
+      }
+    };
+
+    input.addEventListener("keydown", (evt) => {
+      if (evt.key === "Enter") { evt.preventDefault(); finish(true); }
+      else if (evt.key === "Escape") { evt.preventDefault(); finish(false); }
+    });
+    input.addEventListener("blur", () => finish(true));
+  }
 
   if (opts.expanded) await loadChildren();
 
@@ -346,6 +486,10 @@ async function createFolderNode(handle, opts = {}) {
 function highlightFolderRow(row) {
   el("folder-tree").querySelectorAll(".folder-node-row.active").forEach((r) => r.classList.remove("active"));
   row.classList.add("active");
+  // в глубоко вложенном/длинном дереве открытая папка может оказаться за пределами видимой
+  // области прокрутки — без этого непонятно, какая папка сейчас открыта (та же логика, что и
+  // для активной миниатюры в ленте, см. renderThumbnails)
+  row.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 
 // путь именами папок от корня дерева до данного (живого, из текущей сессии) handle'а —
@@ -400,7 +544,20 @@ async function openFolderInExplorer(handle) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: fullPath }),
     });
-    if (!res.ok) throw new Error(await res.text());
+    if (!res.ok) {
+      // сохранённый абсолютный путь корня оказался неверным (папку переместили/переименовали
+      // в реальном Проводнике, либо путь был введён с опечаткой при первом запросе) — забываем
+      // его, чтобы при следующей попытке пользователя снова спросили путь, а не повторяли ту же
+      // ошибку бесконечно
+      State.rootAbsolutePath = null;
+      try {
+        await idbSet("rootAbsolutePath", null);
+        await idbSet("rootAbsolutePathName", null);
+      } catch (_) {
+        // необязательная удобная фича
+      }
+      throw new Error(`путь не найден: "${fullPath}". Попробуйте ещё раз — сейчас переспросим путь заново.`);
+    }
   } catch (e) {
     setStatus("status-bar", "Не удалось открыть Проводник: " + e.message);
   }
@@ -423,15 +580,17 @@ async function expandTreeToPath(namesPath) {
 }
 
 async function buildFolderTree(rootHandle) {
+  const generation = ++State.treeGeneration;
   State.folderRows = new Map();
   State.folderParents = new Map();
   State.folderExpanders = new Map();
   State.folderChildren = new Map();
-  const container = el("folder-tree");
-  container.innerHTML = "";
   const list = document.createElement("ul");
   list.className = "folder-tree-list";
   const rootLi = await createFolderNode(rootHandle, { expanded: true });
+  if (generation !== State.treeGeneration) return; // альбом открыли повторно, пока строилось это дерево — устаревший результат не подменяет уже актуальное дерево
+  const container = el("folder-tree");
+  container.innerHTML = "";
   list.appendChild(rootLi);
   container.appendChild(list);
   highlightFolderRow(rootLi.querySelector(".folder-node-row"));
@@ -570,7 +729,7 @@ async function scanFiles() {
       if (entry.kind === "file") backupNames.add(entry.name);
     }
   } catch (_) {
-    // подпапки .Originals ещё нет — значит ничего не редактировали
+    // папки бэкапов ещё нет — значит ничего не редактировали
   }
 
   const curatedNames = new Set();
@@ -595,7 +754,7 @@ async function scanFiles() {
   setStatus("status-bar", `В альбоме ${State.queue.length} фото.`);
 }
 
-// "Отредактировано" значит не просто "есть файл с таким именем в .Originals",
+// "Отредактировано" значит не просто "есть файл с таким именем в папке бэкапов",
 // а именно "рабочий файл сейчас отличается от резервной копии по размеру" —
 // иначе совпадение имён (например, IMG_0001.jpg с разных карт памяти) даст ложную галочку.
 async function isDifferentFromBackup(workingHandle, originalsHandle, name) {
@@ -2417,7 +2576,7 @@ async function saveCurrent() {
 
     const originalsHandle = await ensureOriginalsHandle();
     if (!item.edited) {
-      // первое сохранение этого фото — уводим нетронутый оригинал в .Originals
+      // первое сохранение этого фото — уводим нетронутый оригинал в папку бэкапов
       const originalFile = await item.handle.getFile();
       const backupHandle = await originalsHandle.getFileHandle(item.name, { create: true });
       const backupWritable = await backupHandle.createWritable();
@@ -2491,7 +2650,7 @@ async function restoreOriginal() {
 
   // главное сделано — файл на диске восстановлен; дальше обновляем состояние и вид
   // независимо от того, получится ли подчистить сопутствующие копии ниже — иначе сбой
-  // уборки в .Originals/куррейтед-папке (например, файл на миг занят антивирусом) откатывал
+  // уборки в папке бэкапов/куррейтед-папке (например, файл на миг занят антивирусом) откатывал
   // бы уже состоявшееся восстановление, и альбом с превью оставались бы необновлёнными
   const wasStarred = item.starred;
   item.edited = false;
@@ -2513,7 +2672,7 @@ async function restoreOriginal() {
   try {
     await originalsHandle.removeEntry(item.name);
   } catch (e) {
-    console.warn("Не удалось удалить резервную копию из .Originals", item.name, e);
+    console.warn("Не удалось удалить резервную копию из папки бэкапов", item.name, e);
   }
   if (wasStarred) {
     try {

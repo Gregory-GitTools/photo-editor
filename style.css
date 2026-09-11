@@ -351,10 +351,24 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 
 .folder-name {
+  flex: 1 1 auto;
+  min-width: 0; /* без этого flex-элемент не сжимается меньше содержимого — ellipsis/инпут переименования не работали бы */
   font-size: 0.9rem;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.folder-rename-input {
+  font: inherit;
+  font-size: 0.9rem;
+  color: inherit;
+  background: #1b1b1f;
+  border: 1px solid #4da3ff;
+  border-radius: 3px;
+  padding: 0 3px;
+  width: 100%;
+  min-width: 60px;
 }
 
 #editor-pane {

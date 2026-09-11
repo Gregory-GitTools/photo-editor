@@ -2,5 +2,6 @@
 Thumbs.db
 icons/Temp/
 icons/Icons Exampl/
-icons/[Originals]/
+icons/\[Originals\]/
+__pycache__/
 logo/Temp/
