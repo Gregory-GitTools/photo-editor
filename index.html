@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link rel="stylesheet" href="style.css">
+<link rel="manifest" href="manifest.json">
 <link rel="icon" href="icons/icon-32.png" sizes="32x32">
 <link rel="icon" href="icons/icon-192.png" sizes="192x192">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
@@ -22,6 +23,9 @@
       <button id="open-album-btn" title="Открыть альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
       <button id="continue-album-btn" hidden title="Продолжить последний альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
       <button id="settings-btn" title="О программе"><img src="icons/Gear WIT.png" alt=""></button>
+      <button id="install-btn" class="svg-icon-btn" title="Установить на рабочий стол" disabled>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5v8.5M5 7.5l3 3 3-3"/><path d="M2.5 11v2.5a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V11"/></svg>
+      </button>
     </div>
     <div id="folder-tree"></div>
     <div id="properties-panel">
@@ -64,6 +68,7 @@
         <canvas id="photo-canvas"></canvas>
         <canvas id="slideshow-fade-canvas"></canvas>
         <audio id="slideshow-audio"></audio>
+        <div id="empty-splash"><img src="icons/logo-rotation.gif" alt=""></div>
       </div>
 
       <div id="resizer-horizontal" class="resizer resizer-horizontal" title="Потяните, чтобы изменить высоту ленты"></div>
@@ -113,7 +118,7 @@
     <h2>О программе Альбом</h2>
     <hr class="about-divider">
     <div class="about-brand">
-      <img src="icons/icon-192.png" alt="Albom" class="about-logo">
+      <img src="icons/logo-rotation.gif" alt="Albom" class="about-logo">
       <div>
         <div class="about-wordmark">Albom</div>
         <div class="about-tagline">Sole / Soul — travel barefoot, dream wide.</div>

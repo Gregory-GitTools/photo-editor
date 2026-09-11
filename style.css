@@ -425,6 +425,23 @@ body.panel-right #canvas-row {
   transition: width 0.2s ease, height 0.2s ease;
 }
 
+/* заставка на пустом канвасе, пока не открыт альбом/фото — скрывается setPhotoControlsEnabled(true)
+   перед отрисовкой первого фото и снова показывается, если открытая папка оказалась без фото */
+#empty-splash {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+#empty-splash img {
+  width: 220px;
+  height: 220px;
+  object-fit: contain;
+  border-radius: 24px;
+}
+
 /* снимок предыдущего кадра слайдшоу, наложенный поверх основного канваса — плавно растворяется
    (не гаснет в чёрное), открывая уже отрисованное под ним следующее фото; см. startSlideshow */
 #slideshow-fade-canvas {
