@@ -1579,6 +1579,48 @@ function photoVisibleQuad(w, h, angleDeg, perspectiveQuad) {
   return rotatedRect.map((p) => mapUV(p.x / w, p.y / h));
 }
 
+// true, если quad — простой выпуклый четырёхугольник (без самопересечений и вогнутых углов):
+// у всех 4 последовательных поворотов (векторное произведение соседних рёбер) один и тот же
+// знак. Вся остальная геометрия рамки обрезки (quadEdges и всё, что на нём построено) трактует
+// quad как пересечение 4 полуплоскостей — это верно только для выпуклого случая; для вогнутого
+// или самопересекающегося ("бабочка") quad та же формула молча считает неверный, но формально
+// проходящий проверки результат (см. clampCornerToConvexQuad, где это используется, чтобы не
+// пускать перспективу в такое положение вообще)
+function isConvexQuad(quad) {
+  let sign = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = quad[i], b = quad[(i + 1) % 4], c = quad[(i + 2) % 4];
+    const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+    if (Math.abs(cross) < 1e-6) continue; // почти коллинеарные точки — само по себе не нарушение
+    const s = cross > 0 ? 1 : -1;
+    if (sign === 0) sign = s;
+    else if (s !== sign) return false;
+  }
+  return true;
+}
+
+// не даёт перетаскиванию угла перспективы завести quad в вогнутое/самопересекающееся положение
+// (см. isConvexQuad) — предыдущий кадр гарантированно валиден (это инвариант, поддерживаемый
+// каждый вызов), поэтому вместо жёсткого запрета ищем бинарным поиском вдоль отрезка
+// "старая точка -> курсор" самую дальнюю ещё допустимую точку: угол свободно тянется куда
+// угодно, пока это не ломает выпуклость, а на границе плавно "упирается", а не дёргается
+function clampCornerToConvexQuad(quad, cornerIdx, candidate) {
+  const old = quad[cornerIdx];
+  const isValid = (pt) => {
+    const q = quad.slice();
+    q[cornerIdx] = pt;
+    return isConvexQuad(q);
+  };
+  if (isValid(candidate)) return candidate;
+  let lo = 0, hi = 1; // lo — доля пути от old к candidate, гарантированно валидная
+  for (let i = 0; i < 20; i++) {
+    const t = (lo + hi) / 2;
+    const pt = { x: old.x + (candidate.x - old.x) * t, y: old.y + (candidate.y - old.y) * t };
+    if (isValid(pt)) lo = t; else hi = t;
+  }
+  return { x: old.x + (candidate.x - old.x) * lo, y: old.y + (candidate.y - old.y) * lo };
+}
+
 // для выпуклого четырёхугольника quad возвращает его 4 ребра с единым (согласованным)
 // направлением обхода — знак sign подобран так, что "cross(e, P-v)*sign >= 0" верно для
 // ЛЮБОЙ точки P внутри quad, независимо от того, в какую сторону (по часовой/против) заданы
@@ -2127,10 +2169,15 @@ function onPointerMove(evt) {
     // а не обрезку; предел — щедрый, но конечный отступ от канваса, чтобы не получить
     // вырожденный (самопересекающийся) четырёхугольник
     const marginX = w * 1.5, marginY = h * 1.5;
-    State.perspectiveQuad[State.dragCorner] = {
+    const candidate = {
       x: clamp(p.x, -marginX, w + marginX),
       y: clamp(p.y, -marginY, h + marginY),
     };
+    // не позволяем quad'у стать вогнутым/самопересекающимся — иначе вся геометрия рамки
+    // обрезки (построенная на предположении о выпуклом quad, см. quadEdges) даёт молчаливо
+    // неверный результат, из-за которого рамка могла "замереть" в неверном положении до тех
+    // пор, пока пользователь не пересоздаст её вручную (см. isConvexQuad)
+    State.perspectiveQuad[State.dragCorner] = clampCornerToConvexQuad(State.perspectiveQuad, State.dragCorner, candidate);
     if (!perspectiveIsAtDefault()) showCropFrame();
     // рамку обрезки трогаем, только если перспектива увела видимую область ВНУТРЬ настолько,
     // что рамка перестала в неё помещаться — тогда её нужно ужать до максимально возможного
