@@ -2332,6 +2332,18 @@ async function ensureCuratedHandle() {
   return State.curatedHandle;
 }
 
+// createWritable() отказывает характерной формулировкой Chromium'а, когда у файла на диске
+// стоит атрибут Windows "только для чтения" — сама File System Access API не даёт странице
+// снять этот атрибут (в ней нет аналога chmod), это можно сделать только вне браузера.
+// Вместо сырого текста ошибки показываем понятную инструкцию, что делать руками
+function describeSaveError(e) {
+  if (/read-only file/i.test(e.message)) {
+    return "файл помечен «только для чтения» в Windows — сам браузер не может это снять. "
+      + "В Проводнике: правой кнопкой по файлу → Свойства → снять галочку «Только для чтения» → ОК, и повторить";
+  }
+  return e.message;
+}
+
 async function syncCuratedCopy(item, fileOrBlob) {
   const curatedHandle = await ensureCuratedHandle();
   const destHandle = await curatedHandle.getFileHandle(item.name, { create: true });
@@ -2358,7 +2370,7 @@ async function toggleStar() {
     updateStarButton(item);
   } catch (e) {
     console.error("Ошибка звезды", item.name, e);
-    setStatus("status-bar", "Ошибка: " + e.message);
+    setStatus("status-bar", "Ошибка: " + describeSaveError(e));
   }
 }
 
@@ -2436,7 +2448,7 @@ async function saveCurrent() {
     setStatus("status-bar", "Сохранено: " + item.name);
   } catch (e) {
     console.error("Ошибка сохранения", item.name, e);
-    setStatus("status-bar", "Ошибка сохранения " + item.name + ": " + e.message);
+    setStatus("status-bar", "Ошибка сохранения " + item.name + ": " + describeSaveError(e));
   }
 }
 
@@ -2473,7 +2485,7 @@ async function restoreOriginal() {
     await verifyWrittenSize(item.handle, backupFile.size, item.name);
   } catch (e) {
     console.error("Ошибка восстановления", item.name, e);
-    setStatus("status-bar", "Ошибка восстановления " + item.name + ": " + e.message);
+    setStatus("status-bar", "Ошибка восстановления " + item.name + ": " + describeSaveError(e));
     return;
   }
 
