@@ -207,6 +207,15 @@ async function openAlbum(handle) {
     el("album-grid").innerHTML = "";
     clearPropertiesPanel();
     State.index = -1;
+    // папка пустая — фото с прошлого альбома должно исчезнуть, а не остаться под заставкой;
+    // обнуляем канвас и битмапы так же, как они выглядят до первого открытия альбома
+    State.previewBitmap = null;
+    State.displayBitmap = null;
+    State.previewW = 0;
+    State.previewH = 0;
+    const c = canvas();
+    c.width = 0;
+    c.height = 0;
     setPhotoControlsEnabled(false);
     return;
   }

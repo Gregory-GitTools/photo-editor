@@ -23,9 +23,6 @@
       <button id="open-album-btn" title="Открыть альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
       <button id="continue-album-btn" hidden title="Продолжить последний альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
       <button id="settings-btn" title="О программе"><img src="icons/Gear WIT.png" alt=""></button>
-      <button id="install-btn" class="svg-icon-btn" title="Установить на рабочий стол" disabled>
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5v8.5M5 7.5l3 3 3-3"/><path d="M2.5 11v2.5a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V11"/></svg>
-      </button>
     </div>
     <div id="folder-tree"></div>
     <div id="properties-panel">
@@ -128,6 +125,11 @@
     <p class="about-text">Эта страница полностью сгенерирована ИИ-помощником Claude.</p>
     <p class="about-text">Больше — на канале <a href="https://www.youtube.com/@Gregory-Flow" target="_blank" rel="noopener">Gregory Flow</a>.</p>
     <p class="about-credits">Сделано на основе открытых инструментов: <a href="https://docs.opencv.org/4.9.0/d5/d10/tutorial_js_root.html" target="_blank" rel="noopener">OpenCV.js</a> (поиск линий горизонта), File System Access API, шрифт — Google Fonts (Poppins).</p>
+    <hr class="about-divider">
+    <div class="about-install">
+      <button id="install-btn" class="text-btn" title="Установить на рабочий стол" disabled>Установить на рабочий стол</button>
+      <p class="about-text about-install-hint">Приложение работает через локальный сервер — перед запуском установленного ярлыка убедитесь, что <code>start.bat</code> запущен.</p>
+    </div>
   </div>
 </div>
 

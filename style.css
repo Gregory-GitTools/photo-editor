@@ -436,10 +436,11 @@ body.panel-right #canvas-row {
 }
 
 #empty-splash img {
-  width: 220px;
-  height: 220px;
+  width: min(660px, 60vmin);
+  height: min(660px, 60vmin);
   object-fit: contain;
   border-radius: 24px;
+  opacity: 0.55;
 }
 
 /* снимок предыдущего кадра слайдшоу, наложенный поверх основного канваса — плавно растворяется
@@ -723,15 +724,19 @@ body.panel-right #album-grid.color-picker-mode {
 
 .about-brand {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 12px;
+  text-align: center;
+  gap: 4px;
   margin: 0 0 16px;
 }
 
 .about-logo {
-  width: 75px;
-  height: 75px;
-  border-radius: 13px;
+  width: 225px;
+  height: 225px;
+  object-fit: contain;
+  border-radius: 24px;
+  opacity: 0.65;
 }
 
 .about-wordmark {
@@ -756,6 +761,24 @@ body.panel-right #album-grid.color-picker-mode {
 
 .modal-content a { color: var(--accent); text-decoration: none; }
 .modal-content a:hover { text-decoration: underline; }
+
+.about-install {
+  margin-top: 16px;
+}
+
+.about-install-hint {
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin: 8px 0 0;
+}
+
+.about-install-hint code {
+  font: inherit;
+  background: #1b1b1f;
+  border: 1px solid #3a3a42;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
 
 .unsaved-modal-actions {
   display: flex;
