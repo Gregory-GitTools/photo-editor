@@ -338,8 +338,11 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .folder-toggle {
   width: 28px;
+  height: 28px;
   flex-shrink: 0;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   font-size: 2rem;
   line-height: 1;
   color: var(--text);
