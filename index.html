@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link rel="stylesheet" href="style.css">
+<link rel="manifest" href="manifest.json">
 <link rel="icon" href="icons/icon-32.png" sizes="32x32">
 <link rel="icon" href="icons/icon-192.png" sizes="192x192">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
@@ -64,6 +65,7 @@
         <canvas id="photo-canvas"></canvas>
         <canvas id="slideshow-fade-canvas"></canvas>
         <audio id="slideshow-audio"></audio>
+        <div id="empty-splash"><img src="icons/logo-rotation.gif" alt=""></div>
       </div>
 
       <div id="resizer-horizontal" class="resizer resizer-horizontal" title="Потяните, чтобы изменить высоту ленты"></div>
@@ -113,7 +115,7 @@
     <h2>О программе Альбом</h2>
     <hr class="about-divider">
     <div class="about-brand">
-      <img src="icons/icon-192.png" alt="Albom" class="about-logo">
+      <img src="icons/logo-rotation.gif" alt="Albom" class="about-logo">
       <div>
         <div class="about-wordmark">Albom</div>
         <div class="about-tagline">Sole / Soul — travel barefoot, dream wide.</div>
@@ -122,7 +124,13 @@
     <p class="about-text">Личный некоммерческий проект — готовит фотографии для <a href="https://gregory-gittools.github.io/travel-globe/" target="_blank" rel="noopener">Travel Globe</a>. Работает полностью локально: фото не покидают компьютер, нет рекламы и сбора данных.</p>
     <p class="about-text">Эта страница полностью сгенерирована ИИ-помощником Claude.</p>
     <p class="about-text">Больше — на канале <a href="https://www.youtube.com/@Gregory-Flow" target="_blank" rel="noopener">Gregory Flow</a>.</p>
+    <hr class="about-divider">
+    <p class="about-install-hint">Приложение работает через локальный сервер — перед запуском установленного ярлыка убедитесь, что <code>start.bat</code> запущен.</p>
     <p class="about-credits">Сделано на основе открытых инструментов: <a href="https://docs.opencv.org/4.9.0/d5/d10/tutorial_js_root.html" target="_blank" rel="noopener">OpenCV.js</a> (поиск линий горизонта), File System Access API, шрифт — Google Fonts (Poppins).</p>
+    <button id="install-btn" class="text-btn about-install-btn" title="Установить на рабочий стол" disabled>
+      <img src="icons/icon-32.png" alt="">
+      Установить на рабочий стол
+    </button>
   </div>
 </div>
 

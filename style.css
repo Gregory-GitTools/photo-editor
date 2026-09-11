@@ -439,6 +439,24 @@ body.panel-right #canvas-row {
   transition: width 0.2s ease, height 0.2s ease;
 }
 
+/* заставка на пустом канвасе, пока не открыт альбом/фото — скрывается setPhotoControlsEnabled(true)
+   перед отрисовкой первого фото и снова показывается, если открытая папка оказалась без фото */
+#empty-splash {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+#empty-splash img {
+  width: min(660px, 60vmin);
+  height: min(660px, 60vmin);
+  object-fit: contain;
+  border-radius: 24px;
+  opacity: 0.275;
+}
+
 /* снимок предыдущего кадра слайдшоу, наложенный поверх основного канваса — плавно растворяется
    (не гаснет в чёрное), открывая уже отрисованное под ним следующее фото; см. startSlideshow */
 #slideshow-fade-canvas {
@@ -720,15 +738,19 @@ body.panel-right #album-grid.color-picker-mode {
 
 .about-brand {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 12px;
+  text-align: center;
+  gap: 4px;
   margin: 0 0 16px;
 }
 
 .about-logo {
-  width: 75px;
-  height: 75px;
-  border-radius: 13px;
+  width: 225px;
+  height: 225px;
+  object-fit: contain;
+  border-radius: 24px;
+  opacity: 0.65;
 }
 
 .about-wordmark {
@@ -748,11 +770,38 @@ body.panel-right #album-grid.color-picker-mode {
   color: var(--muted);
   font-size: 0.8rem;
   line-height: 1.5;
-  margin: 0;
+  margin: 0 0 16px;
 }
 
 .modal-content a { color: var(--accent); text-decoration: none; }
 .modal-content a:hover { text-decoration: underline; }
+
+#about-modal .about-install-hint {
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin: 0 0 12px;
+}
+
+.about-install-hint code {
+  font: inherit;
+  background: #1b1b1f;
+  border: 1px solid #3a3a42;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.about-install-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.about-install-btn img {
+  width: 18px;
+  height: 18px;
+}
 
 .unsaved-modal-actions {
   display: flex;

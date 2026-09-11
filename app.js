@@ -208,6 +208,15 @@ async function openAlbum(handle) {
     el("album-grid").innerHTML = "";
     clearPropertiesPanel();
     State.index = -1;
+    // папка пустая — фото с прошлого альбома должно исчезнуть, а не остаться под заставкой;
+    // обнуляем канвас и битмапы так же, как они выглядят до первого открытия альбома
+    State.previewBitmap = null;
+    State.displayBitmap = null;
+    State.previewW = 0;
+    State.previewH = 0;
+    const c = canvas();
+    c.width = 0;
+    c.height = 0;
     setPhotoControlsEnabled(false);
     return;
   }
@@ -228,6 +237,9 @@ function setPhotoControlsEnabled(enabled) {
   // фото, а refreshDirty() (есть ли реальные несохранённые правки); тут гасим только
   // на выключение, включение при загрузке фото отдаётся refreshDirty() из loadPhoto()
   if (!enabled) el("save-btn").disabled = true;
+  // заставка с вращающимся лого — на пустом канвасе (ни одно фото ещё не открыто, либо
+  // выбранная папка оказалась без фото); прячется, как только реально показано первое фото
+  el("empty-splash").hidden = enabled;
 }
 
 // временно блокирует остальные элементы управления, пока открыт подбор цветовых вариантов
@@ -3393,6 +3405,30 @@ function init() {
   el("about-modal").addEventListener("click", (evt) => {
     if (evt.target.id === "about-modal") closeAboutModal();
   });
+
+  // "Установить на рабочий стол" — сама кнопка живёт всегда (см. правило про disabled вместо
+  // hidden), но реально включается только когда браузер сам решил, что приложение
+  // устанавливаемо, и прислал beforeinstallprompt; без него/после установки — остаётся disabled
+  let deferredInstallPrompt = null;
+  window.addEventListener("beforeinstallprompt", (evt) => {
+    evt.preventDefault();
+    deferredInstallPrompt = evt;
+    el("install-btn").disabled = false;
+  });
+  el("install-btn").addEventListener("click", async () => {
+    if (!deferredInstallPrompt) return;
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    el("install-btn").disabled = true;
+  });
+  window.addEventListener("appinstalled", () => {
+    deferredInstallPrompt = null;
+    el("install-btn").disabled = true;
+  });
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
 
   el("properties-edit-btn").addEventListener("click", () => {
     State.copyMode = !State.copyMode;
