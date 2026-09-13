@@ -15,11 +15,13 @@ const ASPECT_PRESETS = [
 const ASPECT_STORAGE_KEY = "cropAspect";
 const AUTO_HORIZON_STORAGE_KEY = "autoHorizonEnabled";
 const PANEL_MODE_STORAGE_KEY = "albumPanelMode";
+const FOLDER_SORT_STORAGE_KEY = "folderSortOrder";
 // если детектор нашёл "уверенную" линию, но угол больше этого — почти наверняка за горизонт
 // приняли что-то другое (кромку предмета, диагональ переднего плана), лучше пропустить как ошибку
 const AUTO_HORIZON_MAX_ANGLE = 5;
 const ORIGINALS_DIR = "[Originals]";
 const ALBUM_SUFFIX = "-Albom";
+const DELETED_DIR = "Deleted"; // общая для всего альбома корзина, лежит в State.rootHandle (не в каждой подпапке)
 
 const COLOR_VARIANTS = [
   { key: "original", label: "Оригинал", clipPercent: 0, saturationBoost: 1, warm: 0 },
@@ -37,12 +39,17 @@ const State = {
   folderParents: new Map(), // handle -> родительский handle, для построения именного пути к узлу
   folderExpanders: new Map(), // handle -> loadChildren() этого узла, чтобы дойти до вложенной папки программно
   folderChildren: new Map(), // handle -> актуальный список дочерних handle'ов узла после последней подгрузки
+  folderSortMode: "date-desc", // "date-desc" | "date-asc" | "name-asc" | "name-desc" — см. folder-sort-select, listSubdirectories
   treeBuildPromise: null, // промис текущей buildFolderTree — чтобы дождаться дерева перед восстановлением фокуса
   treeGeneration: 0, // счётчик построений дерева — если пока строилось старое, запустили новое, старое не должно дописать свой корень поверх актуального
+  albumsViewActive: false, // true — дерево слева сейчас заменено плоским списком готовых альбомов (см. toggleAlbumsView)
   albumGeneration: 0, // счётчик открытий альбома — чтобы фоновая генерация миниатюр прошлого альбома не писала в чужую сетку
   albumHandle: null,
   originalsHandle: null, // создаётся лениво, только при первом сохранении
   curatedHandle: null, // папка "<альбом>-Albom" — создаётся лениво при первой звёздочке/сохранении
+  deletedHandle: null, // папка DELETED_DIR в корне альбома (State.rootHandle) — создаётся лениво при первом удалении
+  albumAnchorHandle: null, // явно закреплённая пользователем папка — общий родитель для "-Albom" и "Deleted"
+                            // независимо от текущей открытой подпапки; null = поведение как раньше (см. ensureCuratedHandle/ensureDeletedHandle)
   curatedDirName: null, // реальное имя этой папки на диске (см. scanFiles — переживает переименование родителя)
   queue: [], // [{name, handle, edited, starred, thumbUrl}]
   index: -1,
@@ -79,6 +86,7 @@ const State = {
   currentGeo: null, // {lat, lon} текущего фото — для кнопки "Открыть карту"
   currentExif: null, // разобранный EXIF текущего фото — чтобы вернуть камеру/GPS в файл при сохранении
   mapWindow: null, // ссылка на открытое окно карты, чтобы обновлять его при смене фото
+  globeWindow: null, // ссылка на открытое окно глобуса (globe.html), см. mapWindow
   previewZoom: 1, // масштаб превью в canvas-wrap, меняется колесом мыши
   copyMode: false, // режим редактирования параметров: кнопки копирования + редактируемые поля
   updateGpsRow: null, // колбэк, которым клик по карте обновляет отображение строки GPS
@@ -163,6 +171,21 @@ function setStatus(id, text) {
   el(id).textContent = text;
 }
 
+// курсор-ожидание на время долгих операций с деревом папок (перестройка/раскрытие узла может
+// пересканировать большую папку — см. listSubdirectories/folderNewestFileTime). Счётчик, а не
+// просто add/remove класса — эти вызовы бывают вложенными/последовательными (expandTreeToPath
+// раскрывает несколько узлов подряд), и снятие курсора одним из них не должно гасить его, пока
+// другой ещё не закончил
+let busyCursorDepth = 0;
+function pushBusyCursor() {
+  busyCursorDepth++;
+  document.body.classList.add("busy-cursor");
+}
+function popBusyCursor() {
+  busyCursorDepth = Math.max(0, busyCursorDepth - 1);
+  if (busyCursorDepth === 0) document.body.classList.remove("busy-cursor");
+}
+
 async function pickAlbum() {
   let handle;
   try {
@@ -172,10 +195,12 @@ async function pickAlbum() {
     return;
   }
   State.rootHandle = null; // новый ручной выбор — новый корень дерева слева
+  State.albumAnchorHandle = null; // старый анкор принадлежал прошлому дереву — в новом невалиден
   // путь до сфокусированного альбома сбрасываем именно здесь (а не в openAlbum) — там же
   // проходит и восстановление сессии при запуске, которое не должно затирать сохранённый путь
   try {
     await idbSet("lastFocusedPath", []);
+    await idbSet("albumAnchorPath", null);
   } catch (_) {
     // необязательная удобная фича
   }
@@ -189,10 +214,12 @@ async function openAlbum(handle) {
   State.curatedHandle = null;
   State.curatedDirName = null; // реальное имя папки "-Albom" на диске — узнаём при сканировании
   el("continue-album-btn").hidden = true;
+  refreshAnchorUi(); // "Закрепить текущую папку" становится доступна, как только что-то открыто
 
   if (!State.rootHandle) {
     State.rootHandle = handle;
     State.treeBuildPromise = buildFolderTree(handle).catch((e) => console.error("Ошибка построения дерева папок", e));
+    el("albums-list-btn").disabled = false;
     // запоминаем корень дерева — при следующем запуске дерево слева строится от этой же папки
     try {
       await idbSet("lastRoot", handle);
@@ -204,20 +231,7 @@ async function openAlbum(handle) {
   await scanFiles();
   State.albumGeo = new Array(State.queue.length).fill(null);
   if (State.queue.length === 0) {
-    setStatus("status-bar", "В этой папке нет фото (jpg/png). Выберите папку слева.");
-    el("album-grid").innerHTML = "";
-    clearPropertiesPanel();
-    State.index = -1;
-    // папка пустая — фото с прошлого альбома должно исчезнуть, а не остаться под заставкой;
-    // обнуляем канвас и битмапы так же, как они выглядят до первого открытия альбома
-    State.previewBitmap = null;
-    State.displayBitmap = null;
-    State.previewW = 0;
-    State.previewH = 0;
-    const c = canvas();
-    c.width = 0;
-    c.height = 0;
-    setPhotoControlsEnabled(false);
+    showEmptyAlbum();
     return;
   }
 
@@ -229,14 +243,31 @@ async function openAlbum(handle) {
   await selectPhoto(0);
 }
 
+// папка пустая (первое открытие альбома без фото, либо после удаления последнего фото) —
+// фото с прошлого альбома должно исчезнуть, а не остаться под заставкой; обнуляем канвас
+// и битмапы так же, как они выглядят до первого открытия альбома
+function showEmptyAlbum() {
+  setStatus("status-bar", "В этой папке нет фото (jpg/png). Выберите папку слева.");
+  el("album-grid").innerHTML = "";
+  clearPropertiesPanel();
+  State.index = -1;
+  State.previewBitmap = null;
+  State.displayBitmap = null;
+  State.previewW = 0;
+  State.previewH = 0;
+  const c = canvas();
+  c.width = 0;
+  c.height = 0;
+  setPhotoControlsEnabled(false);
+}
+
 function setPhotoControlsEnabled(enabled) {
-  ["reset-btn", "star-btn", "prev-btn", "next-btn", "slideshow-btn", "fullscreen-btn", "rotate-slider", "rotate-toggle-btn", "auto-horizon-btn", "rotate-left-btn", "rotate-right-btn", "flip-btn", "grid-btn", "perspective-btn", "color-btn", "aspect-select", "properties-edit-btn"].forEach((id) => {
+  // "сохранить в альбом" — в общем списке: она не про наличие несохранённых правок, а просто
+  // "отправить" текущее фото (оригинал или уже отредактированное) и его отметку "избранное" в
+  // альбом, так что доступна всегда, пока вообще открыто какое-то фото
+  ["reset-btn", "star-btn", "prev-btn", "next-btn", "slideshow-btn", "fullscreen-btn", "rotate-slider", "rotate-toggle-btn", "auto-horizon-btn", "rotate-left-btn", "rotate-right-btn", "flip-btn", "grid-btn", "perspective-btn", "color-btn", "aspect-select", "properties-edit-btn", "save-btn", "delete-btn"].forEach((id) => {
     el(id).disabled = !enabled;
   });
-  // "сохранить" не входит в общий список — её включённость решает не сам факт открытия
-  // фото, а refreshDirty() (есть ли реальные несохранённые правки); тут гасим только
-  // на выключение, включение при загрузке фото отдаётся refreshDirty() из loadPhoto()
-  if (!enabled) el("save-btn").disabled = true;
   // заставка с вращающимся лого — на пустом канвасе (ни одно фото ещё не открыто, либо
   // выбранная папка оказалась без фото); прячется, как только реально показано первое фото
   el("empty-splash").hidden = enabled;
@@ -244,10 +275,9 @@ function setPhotoControlsEnabled(enabled) {
 
 // временно блокирует остальные элементы управления, пока открыт подбор цветовых вариантов
 function freezeEditingControls(frozen) {
-  ["reset-btn", "star-btn", "prev-btn", "next-btn", "slideshow-btn", "fullscreen-btn", "rotate-slider", "rotate-toggle-btn", "auto-horizon-btn", "rotate-left-btn", "rotate-right-btn", "flip-btn", "grid-btn", "perspective-btn", "aspect-select"].forEach((id) => {
+  ["reset-btn", "star-btn", "prev-btn", "next-btn", "slideshow-btn", "fullscreen-btn", "rotate-slider", "rotate-toggle-btn", "auto-horizon-btn", "rotate-left-btn", "rotate-right-btn", "flip-btn", "grid-btn", "perspective-btn", "aspect-select", "save-btn", "delete-btn"].forEach((id) => {
     el(id).disabled = frozen;
   });
-  el("save-btn").disabled = frozen || !State.dirty;
   if (!frozen && State.index >= 0) {
     el("restore-btn").disabled = !State.queue[State.index].edited;
   } else {
@@ -255,8 +285,29 @@ function freezeEditingControls(frozen) {
   }
 }
 
+// File System Access API не даёт дату изменения самой ПАПКИ (только у файлов через getFile()) —
+// поэтому "дата папки" это дата самого свежего файла непосредственно внутри неё (без рекурсии
+// в подпапки: сортировка вызывается на каждое раскрытие узла дерева, обход всего поддерева был
+// бы слишком дорогим). Для обычной папки-альбома, где фото лежат прямо внутри, это и есть то,
+// что пользователь интуитивно понимает под "когда это было". Папка без файлов напрямую (0) при
+// сортировке "по дате" уходит в конец/начало — тай-брейк по имени ниже не даёт ей прыгать местами.
+async function folderNewestFileTime(dirHandle) {
+  let newest = 0;
+  for await (const entry of dirHandle.values()) {
+    if (entry.kind !== "file") continue;
+    try {
+      const file = await entry.getFile();
+      if (file.lastModified > newest) newest = file.lastModified;
+    } catch (_) {
+      // файл мог исчезнуть между перечислением и чтением — пропускаем
+    }
+  }
+  return newest;
+}
+
 // подпапки текущей папки для дерева слева — скрываем только служебную ORIGINALS_DIR;
-// curated-подпапки "<имя>-Albom" в дереве не прячем — это тоже альбомы, их наличие должно быть видно
+// curated-подпапки "<имя>-Albom" в дереве не прячем — это тоже альбомы, их наличие должно быть видно.
+// Порядок задаётся State.folderSortMode (см. folder-sort-select в тулбаре)
 async function listSubdirectories(dirHandle) {
   const dirs = [];
   for await (const entry of dirHandle.values()) {
@@ -264,8 +315,46 @@ async function listSubdirectories(dirHandle) {
       dirs.push(entry);
     }
   }
-  dirs.sort((a, b) => a.name.localeCompare(b.name));
+  const mode = State.folderSortMode;
+  if (mode === "date-desc" || mode === "date-asc") {
+    const keyed = await Promise.all(dirs.map(async (d) => ({ d, t: await folderNewestFileTime(d) })));
+    keyed.sort((a, b) => (a.t !== b.t ? (mode === "date-desc" ? b.t - a.t : a.t - b.t) : a.d.name.localeCompare(b.d.name)));
+    return keyed.map((k) => k.d);
+  }
+  dirs.sort((a, b) => (mode === "name-desc" ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name)));
   return dirs;
+}
+
+// список всех папок "<...>-Albom" в дереве — на любой глубине, но не внутри уже найденной
+// папки-альбома (см. комментарий у walk() ниже)
+async function findAlbumFolders() {
+  if (!State.rootHandle) return [];
+  async function rawSubdirectories(dirHandle) {
+    const dirs = [];
+    for await (const entry of dirHandle.values()) {
+      if (entry.kind === "directory" && entry.name !== ORIGINALS_DIR) dirs.push(entry);
+    }
+    return dirs;
+  }
+  const found = [];
+  // папки-альбомы могут лежать на любой глубине дерева, но внутрь уже найденной
+  // папки-альбома не заходим — вложенных альбомов в альбомах не бывает. Заодно, как и
+  // обычное построение дерева, попутно заполняем State.folderParents по пройденным папкам —
+  // без этого folderNamePath не смог бы достроить путь для найденных хендлов
+  async function walk(dirHandle, path) {
+    for (const h of await rawSubdirectories(dirHandle)) {
+      State.folderParents.set(h, dirHandle);
+      const childPath = [...path, h.name];
+      if (h.name.endsWith(ALBUM_SUFFIX)) {
+        found.push({ handle: h, name: h.name, path: childPath });
+        continue;
+      }
+      await walk(h, childPath);
+    }
+  }
+  await walk(State.rootHandle, []);
+  found.sort((a, b) => a.name.localeCompare(b.name));
+  return found;
 }
 
 // File System Access API не умеет переименовывать/перемещать ПАПКИ напрямую (FileSystemHandle.move()
@@ -316,26 +405,31 @@ async function createFolderNode(handle, opts = {}) {
   // так что свежесозданные/удалённые/переименованные папки на диске подтягиваются каждый раз —
   // раньше при повторном раскрытии уже виденного узла просто показывался старый childList
   async function loadChildren() {
-    const subdirs = await listSubdirectories(handle);
-    State.folderChildren.set(handle, subdirs);
-    loaded = true;
-    if (subdirs.length === 0) {
-      // подпапки исчезли (были удалены/переименованы с прошлого раза) — прячем и стрелку, и
-      // старый childList целиком, а не оставляем его висеть с уже не существующими записями
-      toggle.textContent = "";
-      if (childList) childList.hidden = true;
-      return;
-    }
-    toggle.textContent = "▾";
-    if (!childList) {
-      childList = document.createElement("ul");
-      childList.className = "folder-tree-list";
-      li.appendChild(childList);
-    }
-    childList.innerHTML = "";
-    childList.hidden = false;
-    for (const sub of subdirs) {
-      childList.appendChild(await createFolderNode(sub, { parent: handle }));
+    pushBusyCursor();
+    try {
+      const subdirs = await listSubdirectories(handle);
+      State.folderChildren.set(handle, subdirs);
+      loaded = true;
+      if (subdirs.length === 0) {
+        // подпапки исчезли (были удалены/переименованы с прошлого раза) — прячем и стрелку, и
+        // старый childList целиком, а не оставляем его висеть с уже не существующими записями
+        toggle.textContent = "";
+        if (childList) childList.hidden = true;
+        return;
+      }
+      toggle.textContent = "▾";
+      if (!childList) {
+        childList = document.createElement("ul");
+        childList.className = "folder-tree-list";
+        li.appendChild(childList);
+      }
+      childList.innerHTML = "";
+      childList.hidden = false;
+      for (const sub of subdirs) {
+        childList.appendChild(await createFolderNode(sub, { parent: handle }));
+      }
+    } finally {
+      popBusyCursor();
     }
   }
   State.folderExpanders.set(handle, loadChildren);
@@ -353,15 +447,35 @@ async function createFolderNode(handle, opts = {}) {
     }
     if (initialSubdirs.length === 0 && !loaded) return; // при создании узла подпапок не было и мы их ещё не проверяли повторно — реагировать не на что
     await loadChildren(); // раскрытие — всегда свежее пересканирование (см. loadChildren)
+    // раскрытый список мог оказаться ниже видимой области дерева (особенно у последней папки,
+    // рядом с растущей снизу панелью "Параметры") — довскроллить дерево так, чтобы весь новый
+    // список стал виден целиком, а не только его верхушка
+    if (childList && !childList.hidden) childList.scrollIntoView({ block: "nearest", behavior: "smooth" });
   });
 
   // и открытие альбома по имени, и переименование папки по её имени — активируются одним и тем
-  // же кликом по name, различаются только тем, была ли эта строка уже выбрана (см. ниже)
+  // же кликом по name, различаются только тем, была ли эта строка уже выбрана (см. ниже).
+  // Порог между "это два клика подряд" (открыть в Проводнике / просто клик) и "это отдельный,
+  // неспешный клик" (переименование) — не браузерный двойной клик (evt.detail), у него порог
+  // завязан на системную скорость двойного клика и на глаз слишком короткий: чуть помедленнее
+  // кликнешь — и вместо повторного открытия сразу улетаешь в переименование. Поэтому считаем
+  // время между кликами сами.
+  let lastNameClickAt = 0;
   name.addEventListener("click", async (evt) => {
-    if (evt.detail > 1) return; // часть быстрого двойного клика — открытие в Проводнике, см. ниже
+    if (evt.detail > 1) return; // часть быстрого (настоящего) двойного клика — уйдёт в open-в-Проводнике, см. ниже
+    const now = Date.now();
+    const firstClickThisSession = lastNameClickAt === 0;
+    const sincePrevClick = now - lastNameClickAt;
+    lastNameClickAt = now;
     if (row.classList.contains("active")) {
-      // повторный (неспешный, не засчитанный браузером как двойной клик) клик по уже открытой
-      // папке — это жест переименования, а не повторное открытие того же альбома
+      // самый первый клик по этой строке за сеанс (строка могла стать активной и без клика по
+      // ней — например, фокус восстановился при старте) — это просто подтверждение фокуса, а
+      // не жест переименования, даже если lastNameClickAt всё ещё 0 и формально "время с
+      // прошлого клика" вышло бы огромным. Переименование — это именно ПОВТОРНЫЙ клик, и то
+      // только в окне 1.5с-2с: быстрее — часть двойного клика (открытие в Проводнике), а
+      // медленнее — окно уже закрылось, иначе абсолютно любой следующий клик по уже открытой
+      // папке (даже через час) считался бы "повторным" и уводил в переименование
+      if (firstClickThisSession || sincePrevClick < 1500 || sincePrevClick > 2000) return;
       startFolderRename();
       return;
     }
@@ -495,13 +609,17 @@ async function createFolderNode(handle, opts = {}) {
   return li;
 }
 
-function highlightFolderRow(row) {
+// opts.center — только для восстановления фокуса при старте приложения (restoreFocusInTree):
+// там строка ещё не была на экране, и её выгодно сразу поставить по центру дерева. При обычном
+// клике мышью по строке (и вообще при любом другом вызове — переименование, смена сортировки)
+// центрирование/подъём к верху ощущался как "строка убегает" из-под курсора: раньше тут всегда
+// стояло block: "start", из-за чего только что кликнутая (уже видимая!) строка ещё и прыгала к
+// верху дерева. block: "nearest" по умолчанию — трогает прокрутку, только если строка правда не
+// видна, и никогда не дальше, чем нужно.
+function highlightFolderRow(row, opts = {}) {
   el("folder-tree").querySelectorAll(".folder-node-row.active").forEach((r) => r.classList.remove("active"));
   row.classList.add("active");
-  // в глубоко вложенном/длинном дереве открытая папка может оказаться за пределами видимой
-  // области прокрутки — без этого непонятно, какая папка сейчас открыта (та же логика, что и
-  // для активной миниатюры в ленте, см. renderThumbnails)
-  row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  row.scrollIntoView({ block: opts.center ? "center" : "nearest", behavior: "smooth" });
 }
 
 // путь именами папок от корня дерева до данного (живого, из текущей сессии) handle'а —
@@ -522,18 +640,23 @@ function folderNamePath(handle) {
 // Проводник на нужной папке это спросить у пользователя абсолютный путь к корню один раз
 // и дальше достраивать его именами подпапок (folderNamePath). Запоминаем ответ в IndexedDB
 // вместе с именем корня, чтобы при том же альбоме больше не спрашивать.
-async function ensureRootAbsolutePath() {
-  if (State.rootAbsolutePath) return State.rootAbsolutePath;
+// подгружает путь, уже сохранённый в IndexedDB для этого же (по имени) корня — общая часть
+// для ensureRootAbsolutePath (запрос при первом клике "Открыть в Проводнике") и для настроек
+// (там путь нужно показать, даже если Проводник в этой сессии ещё ни разу не открывали)
+async function loadSavedRootAbsolutePath() {
+  if (State.rootAbsolutePath || !State.rootHandle) return State.rootAbsolutePath;
   try {
     const savedPath = await idbGet("rootAbsolutePath");
     const savedName = await idbGet("rootAbsolutePathName");
-    if (savedPath && savedName === State.rootHandle.name) {
-      State.rootAbsolutePath = savedPath;
-      return savedPath;
-    }
+    if (savedPath && savedName === State.rootHandle.name) State.rootAbsolutePath = savedPath;
   } catch (_) {
     // необязательная удобная фича
   }
+  return State.rootAbsolutePath;
+}
+
+async function ensureRootAbsolutePath() {
+  if (await loadSavedRootAbsolutePath()) return State.rootAbsolutePath;
   const input = prompt(`Открытие в Проводнике: укажите полный путь на диске к папке "${State.rootHandle.name}" (спрашивается один раз для этого альбома).`, "");
   if (!input) return null;
   State.rootAbsolutePath = input.replace(/[\\/]+$/, "");
@@ -592,20 +715,26 @@ async function expandTreeToPath(namesPath) {
 }
 
 async function buildFolderTree(rootHandle) {
-  const generation = ++State.treeGeneration;
-  State.folderRows = new Map();
-  State.folderParents = new Map();
-  State.folderExpanders = new Map();
-  State.folderChildren = new Map();
-  const list = document.createElement("ul");
-  list.className = "folder-tree-list";
-  const rootLi = await createFolderNode(rootHandle, { expanded: true });
-  if (generation !== State.treeGeneration) return; // альбом открыли повторно, пока строилось это дерево — устаревший результат не подменяет уже актуальное дерево
-  const container = el("folder-tree");
-  container.innerHTML = "";
-  list.appendChild(rootLi);
-  container.appendChild(list);
-  highlightFolderRow(rootLi.querySelector(".folder-node-row"));
+  el("folder-tree").innerHTML = "<p class=\"albums-list-empty\">Поиск…</p>";
+  pushBusyCursor(); // построение дерева пересканирует диск (см. loadChildren) — в большой папке это заметно по времени
+  try {
+    const generation = ++State.treeGeneration;
+    State.folderRows = new Map();
+    State.folderParents = new Map();
+    State.folderExpanders = new Map();
+    State.folderChildren = new Map();
+    const list = document.createElement("ul");
+    list.className = "folder-tree-list";
+    const rootLi = await createFolderNode(rootHandle, { expanded: true });
+    if (generation !== State.treeGeneration) return; // альбом открыли повторно, пока строилось это дерево — устаревший результат не подменяет уже актуальное дерево
+    const container = el("folder-tree");
+    container.innerHTML = "";
+    list.appendChild(rootLi);
+    container.appendChild(list);
+    highlightFolderRow(rootLi.querySelector(".folder-node-row"));
+  } finally {
+    popBusyCursor();
+  }
 }
 
 // хранение хендла последней открытой папки в IndexedDB, чтобы при следующем запуске
@@ -670,6 +799,7 @@ async function tryRestoreLastAlbum() {
     State.rootHandle = null;
     await openAlbum(handle);
     await restoreFocusInTree();
+    await restoreAlbumAnchor();
     return;
   }
 
@@ -684,6 +814,7 @@ async function tryRestoreLastAlbum() {
         State.rootHandle = null;
         await openAlbum(handle);
         await restoreFocusInTree();
+        await restoreAlbumAnchor();
       } else {
         setStatus("status-bar", "Доступ к папке не разрешён.");
       }
@@ -715,22 +846,57 @@ async function restoreFocusInTree() {
   if (!target || target === State.rootHandle) return;
 
   const row = State.folderRows.get(target);
-  if (row) highlightFolderRow(row);
+  // приложение только что открылось — строка ещё не была на экране, центрируем её в дереве
+  // (в отличие от обычного клика мышью, см. комментарий у highlightFolderRow)
+  if (row) highlightFolderRow(row, { center: true });
   await openAlbum(target);
+}
+
+// анкор хранится как именной путь от корня (см. folderNamePath/expandTreeToPath), а не
+// отдельный handle со своим разрешением доступа — так восстановление не требует второго,
+// независимого от rootHandle запроса permission
+async function restoreAlbumAnchor() {
+  let path;
+  try {
+    path = await idbGet("albumAnchorPath");
+  } catch (_) {
+    return;
+  }
+  // path === [] значит анкор закреплён на самом rootHandle — валидное значение, в отличие
+  // от path === null/undefined ("анкор не закреплён"), поэтому длина пути тут не проверяется
+  if (path == null) return;
+  const target = await expandTreeToPath(path);
+  if (!target) return;
+  State.albumAnchorHandle = target;
+  refreshAnchorUi();
+  // альбом мог уже быть просканирован (openAlbum вызывался раньше, до восстановления анкора,
+  // см. tryRestoreLastAlbum) — пересканируем, чтобы звёздочки/curatedDirName учли анкор сразу
+  if (State.albumHandle) {
+    State.curatedHandle = null;
+    State.curatedDirName = null;
+    await scanFiles();
+    if (State.queue.length > 0) buildGrid();
+  }
 }
 
 async function scanFiles() {
   setStatus("status-bar", "Сканирую альбом...");
   const imageRe = /\.(jpe?g|png)$/i;
   const files = [];
-  let curatedDirName = null;
   for await (const entry of State.albumHandle.values()) {
     if (entry.kind === "file" && imageRe.test(entry.name)) files.push(entry);
-    // ищем подпапку "-Albom" по факту, а не по совпадению с текущим именем родителя —
-    // если саму папку альбома переименовали в проводнике, старая подпапка сохранит старое имя
-    else if (entry.kind === "directory" && entry.name.endsWith(ALBUM_SUFFIX)) curatedDirName = entry.name;
   }
   files.sort((a, b) => a.name.localeCompare(b.name));
+
+  // папку "-Albom" ищем не в открытой сейчас подпапке, а в опорной (если она закреплена, см.
+  // State.albumAnchorHandle) — иначе у альбома с камерами по разным подпапкам была бы своя
+  // "-Albom" на каждую подпапку; ищем по факту наличия суффикса, а не по совпадению с именем
+  // родителя — если саму папку альбома переименовали в проводнике, подпапка сохранит старое имя
+  const curatedParent = State.albumAnchorHandle || State.albumHandle;
+  let curatedDirName = null;
+  for await (const entry of curatedParent.values()) {
+    if (entry.kind === "directory" && entry.name.endsWith(ALBUM_SUFFIX)) { curatedDirName = entry.name; break; }
+  }
   State.curatedDirName = curatedDirName;
 
   let originalsHandle = null;
@@ -747,7 +913,7 @@ async function scanFiles() {
   const curatedNames = new Set();
   if (curatedDirName) {
     try {
-      const curatedHandle = await State.albumHandle.getDirectoryHandle(curatedDirName);
+      const curatedHandle = await curatedParent.getDirectoryHandle(curatedDirName);
       for await (const entry of curatedHandle.values()) {
         if (entry.kind === "file") curatedNames.add(entry.name);
       }
@@ -787,9 +953,6 @@ function buildGrid() {
   State.queue.forEach((item, i) => {
     const btn = document.createElement("button");
     btn.className = "thumb";
-    // порядок миниатюры в ленте — на случай бокового режима, где она физически переезжает
-    // внутрь одной из .thumb-col обёрток (см. layoutRightColumns) и перестаёт быть прямым
-    // ребёнком #album-grid по индексу в DOM
     btn.dataset.index = i;
     const img = document.createElement("img");
     img.alt = item.name;
@@ -830,9 +993,8 @@ function makeStarBadge() {
   return badge;
 }
 
-// находит кнопку-миниатюру по индексу фото в очереди — а не по позиции среди детей #album-grid
-// напрямую (grid.children[i]), потому что в боковом режиме миниатюры физически переезжают
-// внутрь обёрток .thumb-col (см. layoutRightColumns) и перестают быть прямыми детьми ленты
+// находит кнопку-миниатюру по индексу фото в очереди (data-index), а не по позиции среди
+// детей #album-grid (grid.children[i]) — индекс фото не всегда совпадает с позицией в DOM
 function thumbAt(i) {
   return el("album-grid").querySelector(`.thumb[data-index="${i}"]`);
 }
@@ -877,9 +1039,7 @@ function updateStarButton(item) {
 function highlightActiveThumb() {
   const grid = el("album-grid");
   // find() тут не подходит — он останавливается на первом совпадении и не доходит до
-  // миниатюр после него, поэтому при движении назад подсветка с них не снималась; перебираем
-  // все .thumb (а не grid.children напрямую) — в боковом режиме они лежат внутри обёрток
-  // .thumb-col, а не прямыми детьми ленты, зато data-index всегда хранит настоящий индекс фото
+  // миниатюр после него, поэтому при движении назад подсветка с них не снималась
   let active = null;
   grid.querySelectorAll(".thumb").forEach((c) => {
     const isActive = +c.dataset.index === State.index;
@@ -887,13 +1047,15 @@ function highlightActiveThumb() {
     if (isActive) active = c;
   });
   // в длинных альбомах активная миниатюра может быть за пределами видимой ленты — центрируем
-  // прокрутку на ней, иначе непонятно, на каком фото сейчас фокус (в боковом режиме лента
-  // листается по вертикали, в нижнем — по горизонтали)
+  // прокрутку на ней, иначе непонятно, на каком фото сейчас фокус. Ось листания зависит от
+  // режима: в нижнем и в боковом многостолбцовом (столбцы растянуты на всю высоту ленты) —
+  // по горизонтали; в боковом одностолбцовом (.single-column, см. updateColumnMode()) — как
+  // обычный список, по вертикали
   if (active) {
-    const right = document.body.classList.contains("panel-right");
+    const vertical = grid.classList.contains("single-column");
     active.scrollIntoView({
-      inline: right ? "nearest" : "center",
-      block: right ? "center" : "nearest",
+      inline: vertical ? "nearest" : "center",
+      block: vertical ? "center" : "nearest",
       behavior: "smooth",
     });
   }
@@ -1532,13 +1694,19 @@ function setCurrentGeo(lat, lon) {
 function setMapButtonsEnabled(enabled) {
   el("properties-map-btn").disabled = !enabled;
   el("properties-map-new-btn").disabled = !enabled;
+  el("globe-btn").disabled = !enabled;
 }
 
-// единая точка обновления обеих карт — встроенной и всплывающего окна — так они всегда
-// показывают один и тот же набор меток всего альбома и одинаково подсвечивают текущее фото
+// единая точка обновления обеих карт и глобуса — так все три всегда показывают один и тот
+// же набор меток текущего альбома и одинаково подсвечивают текущее фото
 function refreshMaps() {
   if (State.mapWindow && !State.mapWindow.closed) {
     State.mapWindow.postMessage({ points: State.albumGeo, activeIndex: State.index, copyMode: State.copyMode }, "*");
+  }
+  if (State.globeWindow && !State.globeWindow.closed) {
+    // глобус только показывает и позволяет кликом перейти к фото — простановку координат
+    // кликом (copyMode) не поддерживает, поэтому её не шлём
+    State.globeWindow.postMessage({ points: State.albumGeo, activeIndex: State.index }, "*");
   }
   const embedWrap = el("properties-map-embed");
   if (embedWrap && !embedWrap.hidden) refreshEmbeddedMapMarkers();
@@ -1626,6 +1794,29 @@ function onMapWindowClosed() {
   el("properties-map-new-btn").classList.remove("active");
 }
 
+let globeWindowWatcher = null; // следит за окном глобуса, чтобы погасить кнопку, если его закрыли крестиком
+
+function toggleGlobeWindow() {
+  if (State.globeWindow && !State.globeWindow.closed) {
+    State.globeWindow.close();
+    onGlobeWindowClosed();
+    return;
+  }
+  State.globeWindow = window.open("globe.html", "albom_globe");
+  el("globe-btn").classList.add("active");
+  clearInterval(globeWindowWatcher);
+  globeWindowWatcher = setInterval(() => {
+    if (!State.globeWindow || State.globeWindow.closed) onGlobeWindowClosed();
+  }, 500);
+}
+
+function onGlobeWindowClosed() {
+  clearInterval(globeWindowWatcher);
+  globeWindowWatcher = null;
+  State.globeWindow = null;
+  el("globe-btn").classList.remove("active");
+}
+
 function formatFileSize(bytes) {
   if (bytes < 1024) return bytes + " Б";
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " КБ";
@@ -1705,9 +1896,6 @@ function refreshDirty() {
     && State.netQuarterTurns === 0
     && !State.netFlipped;
   State.dirty = State.exifDirty || !visuallyNeutral;
-  // кнопка "сохранить" должна отражать именно этот пересчитанный dirty, а не просто
-  // "фото открыто" — иначе она горит даже при простом просмотре без правок
-  el("save-btn").disabled = !State.dirty;
 }
 
 // подстраховка: рамка кадрирования никогда не должна вылезать за пределы канваса —
@@ -2494,13 +2682,88 @@ async function ensureOriginalsHandle() {
 
 async function ensureCuratedHandle() {
   if (!State.curatedHandle) {
-    // если такая папка уже найдена при сканировании (пусть и под старым именем после переименования
-    // родителя) — используем её, иначе создаём новую с текущим именем альбома
-    const folderName = State.curatedDirName || State.albumHandle.name + ALBUM_SUFFIX;
-    State.curatedHandle = await State.albumHandle.getDirectoryHandle(folderName, { create: true });
+    // родитель — закреплённая опорная папка (если есть), иначе как раньше — текущая открытая
+    // (см. State.albumAnchorHandle); если такая папка уже найдена при сканировании (пусть и под
+    // старым именем после переименования родителя) — используем её, иначе создаём новую
+    const parent = State.albumAnchorHandle || State.albumHandle;
+    const folderName = State.curatedDirName || parent.name + ALBUM_SUFFIX;
+    State.curatedHandle = await parent.getDirectoryHandle(folderName, { create: true });
     State.curatedDirName = folderName;
   }
   return State.curatedHandle;
+}
+
+async function ensureDeletedHandle() {
+  if (!State.deletedHandle) {
+    const parent = State.albumAnchorHandle || State.rootHandle;
+    State.deletedHandle = await parent.getDirectoryHandle(DELETED_DIR, { create: true });
+  }
+  return State.deletedHandle;
+}
+
+// закрепляет explicit опорную папку — общий родитель для "-Albom" и "Deleted" (см. State.albumAnchorHandle)
+async function setAlbumAnchor(handle) {
+  State.albumAnchorHandle = handle;
+  try { await idbSet("albumAnchorPath", folderNamePath(handle)); } catch (_) {}
+  State.curatedHandle = null;
+  State.curatedDirName = null;
+  State.deletedHandle = null;
+  await scanFiles();
+  if (State.queue.length > 0) buildGrid();
+  refreshAnchorUi();
+}
+
+async function clearAlbumAnchor() {
+  State.albumAnchorHandle = null;
+  try { await idbSet("albumAnchorPath", null); } catch (_) {}
+  State.curatedHandle = null;
+  State.curatedDirName = null;
+  State.deletedHandle = null;
+  await scanFiles();
+  if (State.queue.length > 0) buildGrid();
+  refreshAnchorUi();
+}
+
+// перемещает текущее фото из рабочей папки в общую корзину DELETED_DIR в корне альбома
+// (State.rootHandle) — бэкап в [Originals] и куррейтед-копию в "-Albom" не трогаем, они не
+// про "показывать это фото", а про историю правок/избранное, удаление файла их не отменяет
+async function deleteCurrentPhoto() {
+  if (State.index < 0) return;
+  const item = State.queue[State.index];
+  setStatus("status-bar", "Удаляю " + item.name + "...");
+
+  try {
+    const deletedHandle = await ensureDeletedHandle();
+    if (typeof item.handle.move === "function") {
+      await item.handle.move(deletedHandle, item.name);
+    } else {
+      const file = await item.handle.getFile();
+      const destHandle = await deletedHandle.getFileHandle(item.name, { create: true });
+      const writable = await destHandle.createWritable();
+      await writable.write(file);
+      await writable.close();
+      await verifyWrittenSize(destHandle, file.size, "перемещение в «Deleted»: " + item.name);
+      await State.albumHandle.removeEntry(item.name);
+    }
+
+    const removedIndex = State.index;
+    const generation = ++State.albumGeneration;
+    await scanFiles();
+    State.albumGeo = new Array(State.queue.length).fill(null);
+    if (State.queue.length === 0) {
+      showEmptyAlbum();
+      return;
+    }
+    buildGrid();
+    generateThumbnails(generation);
+    collectAlbumGeo(generation);
+    State.index = -1;
+    await selectPhoto(Math.min(removedIndex, State.queue.length - 1));
+    setStatus("status-bar", "Удалено: " + item.name);
+  } catch (e) {
+    console.error("Ошибка удаления", item.name, e);
+    setStatus("status-bar", "Ошибка удаления " + item.name + ": " + describeSaveError(e));
+  }
 }
 
 // createWritable() отказывает характерной формулировкой Chromium'а, когда у файла на диске
@@ -2917,10 +3180,6 @@ function toggleRightPanel() {
     // и наоборот — высота, унаследованная от нижнего режима, не должна мешать ленте
     // растянуться на всю доступную высоту в боковом режиме
     el("album-grid").style.height = "";
-    // свежий вход в боковой режим всегда начинается с 1 столбика — иначе гистерезис в
-    // updateThumbSizing() унаследовал бы число столбиков от прошлого раза и мог ошибочно
-    // остаться на нём же при той же ширине ленты
-    rightPanelCols = 1;
   } else {
     body.classList.toggle("hide-bottom");
   }
@@ -2946,102 +3205,31 @@ function savePanelMode() {
   localStorage.setItem(PANEL_MODE_STORAGE_KEY, right + hidden);
 }
 
-// размер, до которого может дорасти миниатюра в 2+ столбика (примерно на треть больше, чем было
-// раньше, ~110px) — пока места меньше, миниатюра растёт вместе с шириной ленты (обычное точное
-// деление, без пустот), а начиная с этого потолка лишняя ширина уже не идёт в размер, а копится
-// как задел на появление следующего столбика (см. GROW_PEEK)
-const RIGHT_THUMB_CAP = 145;
-const RIGHT_GAP = 8;
-// сколько места (px) сверх точного вмещения текущих столбиков нужно накопить, чтобы появился
-// следующий — было 110px (столбик появлялся, только когда набегало место на целый новый
-// полноразмерный), стало всего 40px, поэтому лента заметно раньше показывает следующий столбик
-const RIGHT_GROW_PEEK = 40;
-
-// ширина, при которой текущие n столбиков (n >= 2) уже вмещаются на полный RIGHT_THUMB_CAP
-// каждый, без обрезки
-function rightColFullWidth(n) {
-  return n * (RIGHT_THUMB_CAP + RIGHT_GAP) - RIGHT_GAP;
-}
-
-// граница (в пикселях доступной ширины), после которой в боковой ленте появляется (n+1)-й
-// столбик — первый столбик растёт свободно до 220px (это чуть больше ширины ленты по умолчанию,
-// чтобы вход в боковой режим не подкидывал сразу 2 столбика); каждый следующий столбик появляется,
-// как только накопится RIGHT_GROW_PEEK лишнего места сверх точного вмещения предыдущих
-function rightColGrowBoundary(n) {
-  return n === 1 ? 220 : rightColFullWidth(n) + RIGHT_GROW_PEEK;
-}
-
-// текущее число столбиков боковой ленты — хранится между вызовами updateThumbSizing(), это и
-// есть "память" петли гистерезиса (см. ниже); сбрасывается на 1 при каждом свежем включении
-// бокового режима (toggleRightPanel), чтобы не унаследовать число столбиков от предыдущего сеанса
-let rightPanelCols = 1;
-
-// пересчитывает размер миниатюр под текущую ширину/высоту ленты (см. .thumb в style.css) —
-// нижний режим просто использует доступную высоту ленты напрямую (одна строка, перенос не
-// нужен — лишнее уезжает по горизонтали); боковой режим делит доступную ширину на rightPanelCols
-// столбиков (см. RIGHT_THUMB_CAP — потолок роста), а само число столбиков меняется через петлю
-// гистерезиса (rightColGrowBoundary) — появление и исчезновение столбика происходит на РАЗНЫХ
-// границах ширины: столбик добавляется, как только пересечена его граница появления, а убирается
-// только когда ширина отступает от неё заметно (на HYSTERESIS px) назад — иначе на границе ширина
-// туда-обратно на пиксель заставляла бы столбик дёргаться туда-сюда
-// собирает миниатюры (в порядке data-index, а не текущего положения в DOM) обратно прямыми
-// детьми #album-grid и убирает опустевшие обёртки .thumb-col — нужно как перед переходом в
-// нижний режим (там раскладка по столбикам не нужна вовсе), так и перед перекладкой боковой
-// ленты на новое число столбиков (проще собрать по новой, чем аккуратно перемещать частями)
-function flattenRightColumns(grid) {
-  const thumbs = [...grid.querySelectorAll(".thumb")].sort((a, b) => a.dataset.index - b.dataset.index);
-  thumbs.forEach((t) => grid.appendChild(t));
-  grid.querySelectorAll(":scope > .thumb-col").forEach((w) => w.remove());
-}
-
-// раскладывает миниатюры по cols обёрткам-столбикам подряд, сверху вниз — сначала все,
-// сколько влезет, в первый столбик, потом следующий и т.д. (первые ceil(count/cols) индексов
-// уходят в столбик 0, следующие столько же — в столбик 1, и т.д.); у миниатюр разная высота
-// (см. .thumb в style.css — теперь она подстраивается под настоящие пропорции кадра), поэтому
-// в отличие от прежней CSS grid-раскладки высоту столбиков тут никто явно не считает — просто
-// сколько есть, столько и уходит вниз, а лента целиком прокручивается по вертикали при переполнении
-// во время перетаскивания границы ленты updateThumbSizing() вызывается на каждое движение
-// мыши, но число столбиков (в отличие от --thumb-size) меняется далеко не на каждом кадре —
-// перекладывать миниатюры по DOM заново, когда лента уже разложена ровно на cols обёрток,
-// незачем (а после buildGrid()/showColorVariantPicker() дети всегда плоские — .thumb напрямую,
-// без .thumb-col, — поэтому свежепостроенная лента здесь никогда не пропустит перекладку)
-function layoutRightColumns(grid, cols) {
-  const alreadyLaidOut = grid.children.length === cols && [...grid.children].every((c) => c.classList.contains("thumb-col"));
-  if (alreadyLaidOut) return;
-  flattenRightColumns(grid);
-  const thumbs = [...grid.querySelectorAll(".thumb")];
-  const perCol = Math.max(1, Math.ceil(thumbs.length / cols));
-  const wraps = [];
-  for (let c = 0; c < cols; c++) {
-    const wrap = document.createElement("div");
-    wrap.className = "thumb-col";
-    grid.appendChild(wrap);
-    wraps.push(wrap);
-  }
-  thumbs.forEach((t, i) => {
-    wraps[Math.min(cols - 1, Math.floor(i / perCol))].appendChild(t);
-  });
-}
-
+// пересчитывает высоту миниатюр под текущую высоту ленты в нижнем режиме (одна строка,
+// перенос не нужен — лишнее уезжает по горизонтали, см. .thumb в style.css). В боковом режиме
+// размер миниатюр не считается тут вообще — ширина фиксирована (3см), высота идёт от
+// пропорций кадра, всё через CSS (см. .thumb в style.css) — вместо этого пересчитывается
+// одностолбцовый режим (см. updateColumnMode)
 function updateThumbSizing() {
   const grid = el("album-grid");
   if (document.body.classList.contains("panel-right")) {
-    const w = grid.getBoundingClientRect().width;
-    const available = Math.max(30, w - 24);
-    const HYSTERESIS = 25;
-    while (available >= rightColGrowBoundary(rightPanelCols)) rightPanelCols++;
-    while (rightPanelCols > 1 && available < rightColGrowBoundary(rightPanelCols - 1) - HYSTERESIS) rightPanelCols--;
-    const cols = rightPanelCols;
-    let size = (available - RIGHT_GAP * (cols - 1)) / cols;
-    if (cols > 1) size = Math.min(size, RIGHT_THUMB_CAP);
-    grid.style.setProperty("--thumb-size", size + "px");
-    layoutRightColumns(grid, cols);
-  } else {
-    flattenRightColumns(grid);
-    const h = grid.getBoundingClientRect().height;
-    const size = Math.max(30, h - 20);
-    grid.style.setProperty("--thumb-size", size + "px");
+    updateColumnMode(grid);
+    return;
   }
+  const h = grid.getBoundingClientRect().height;
+  const size = Math.max(30, h - 20);
+  grid.style.setProperty("--thumb-size", size + "px");
+}
+
+// если по ширине ленты помещается только один столбец миниатюр, второй (недоступный) столбец
+// не имеет смысла — вместо обрезанной по ширине сетки со скроллом на пару пикселей включаем
+// единый список в один столбец с обычной вертикальной прокруткой (см. .single-column в
+// style.css); как только ширины хватает на два столбца — возвращаемся к обычной раскладке
+// столбцами с горизонтальной прокруткой между ними
+function updateColumnMode(grid) {
+  const thumb = grid.querySelector(".thumb");
+  const single = !!thumb && grid.clientWidth < thumb.getBoundingClientRect().width * 2 + 2;
+  grid.classList.toggle("single-column", single);
 }
 
 // стрелки листают фото по всей ленте — и в обычном окне, и в полноэкранном просмотре/слайдшоу
@@ -3073,31 +3261,51 @@ function onViewerKeydown(evt) {
   goToPhoto(+next.dataset.index);
 }
 
-// находит соседнюю миниатюру по стрелке, опираясь на настоящую DOM-структуру ленты, а не на
-// арифметику индексов (index +/- perCol) — в боковом режиме последний столбик почти всегда
-// короче остальных (perCol не делит общее число миниатюр нацело, см. layoutRightColumns), и
-// наивный прыжок на perCol индексов вперёд из "длинной" строки короткого столбика промахивался
-// бы мимо диапазона и застревал, не доходя до последнего столбика; тут же для влево/вправо
-// просто берём тот же (или ближайший существующий, если столбик короче) ряд соседней обёртки
-// .thumb-col, а для вверх/вниз — соседа по DOM-порядку внутри столбика
+// находит соседнюю миниатюру по стрелке. В нижнем режиме миниатюры — один горизонтальный ряд,
+// сосед по стрелке влево/вправо — это просто соседний элемент по DOM (вверх/вниз там смысла не
+// имеют).
+// В боковом режиме — настоящие столбцы (flex-wrap), там нужны все четыре стрелки: вверх/вниз —
+// сосед в том же столбце, влево/вправо — переход в соседний столбец. DOM-порядок тут не годится
+// ни для одной из осей (на границе столбца следующий элемент по DOM — это первый элемент
+// СЛЕДУЮЩЕГО столбца, а не сосед снизу/сверху; а элементы одного столбца в DOM вообще не соседи
+// элементов соседнего). Поэтому ищем геометрически: для вверх/вниз — среди элементов, чей
+// горизонтальный диапазон пересекается с текущим (тот же столбец), ближайший по вертикали; для
+// влево/вправо — среди элементов, чей вертикальный диапазон пересекается с текущим (та же
+// "строка"), ближайший по горизонтали. Если геометрического соседа нет (упёрлись в верх/низ
+// столбца) — вверх/вниз продолжают листать по порядку фото (DOM-порядок в боковом режиме и есть
+// порядок фото: сверху вниз по столбцу, затем с начала следующего столбца), пока не кончится
+// альбом. Для влево/вправо такого запасного варианта нет — если соседней "строки" нет, стрелка
+// просто ничего не делает (без зацикливания)
 function findGridNeighbor(current, key) {
-  const parent = current.parentElement;
-  if (parent.classList.contains("thumb-col")) {
-    const items = [...parent.children];
-    const row = items.indexOf(current);
-    if (key === "ArrowUp") return items[row - 1] || null;
-    if (key === "ArrowDown") return items[row + 1] || null;
-    const cols = [...parent.parentElement.children].filter((c) => c.classList.contains("thumb-col"));
-    const targetCol = cols[cols.indexOf(parent) + (key === "ArrowLeft" ? -1 : 1)];
-    if (!targetCol) return null;
-    const targetItems = [...targetCol.children];
-    return targetItems[Math.min(row, targetItems.length - 1)] || null;
+  const right = document.body.classList.contains("panel-right");
+  if (!right && (key === "ArrowUp" || key === "ArrowDown")) return null;
+  const items = [...current.parentElement.children];
+  if (!right) {
+    const idx = items.indexOf(current);
+    return items[idx + (key === "ArrowLeft" ? -1 : 1)] || null;
   }
-  // нижний режим: один горизонтальный ряд прямых детей ленты, вверх/вниз тут не при делах
-  if (key === "ArrowUp" || key === "ArrowDown") return null;
-  const items = [...parent.children];
-  const idx = items.indexOf(current);
-  return items[idx + (key === "ArrowLeft" ? -1 : 1)] || null;
+  const vertical = key === "ArrowUp" || key === "ArrowDown";
+  const forward = key === "ArrowDown" || key === "ArrowRight";
+  const cur = current.getBoundingClientRect();
+  let best = null, bestDist = Infinity;
+  for (const item of items) {
+    if (item === current) continue;
+    const r = item.getBoundingClientRect();
+    if (vertical) {
+      if (r.left >= cur.right || r.right <= cur.left) continue;
+      const dist = forward ? r.top - cur.top : cur.top - r.top;
+      if (dist > 0 && dist < bestDist) { bestDist = dist; best = item; }
+    } else {
+      if (r.top >= cur.bottom || r.bottom <= cur.top) continue;
+      const dist = forward ? r.left - cur.left : cur.left - r.left;
+      if (dist > 0 && dist < bestDist) { bestDist = dist; best = item; }
+    }
+  }
+  if (vertical && !best) {
+    const idx = items.indexOf(current);
+    best = items[idx + (forward ? 1 : -1)] || null;
+  }
+  return best;
 }
 
 // сброс угла в 0 без статус-сообщения "задан вручную" (в отличие от onRotateInput) — используется,
@@ -3316,8 +3524,95 @@ function toggleColorPicker() {
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function round1(v) { return Math.round(v * 10) / 10; }
 
-function openAboutModal() { el("about-modal").hidden = false; }
+function openAboutModal() {
+  el("about-modal").hidden = false;
+  const input = el("root-path-input");
+  input.disabled = !State.rootHandle;
+  input.value = State.rootAbsolutePath || "";
+  refreshAnchorUi();
+}
 function closeAboutModal() { el("about-modal").hidden = true; }
+
+// отражает State.albumAnchorHandle в окне настроек — путь (если закреплён) и доступность кнопок
+function refreshAnchorUi() {
+  const input = el("anchor-path-input");
+  if (!input) return;
+  input.value = State.albumAnchorHandle
+    ? (folderNamePath(State.albumAnchorHandle).join(" / ") || State.rootHandle.name)
+    : "";
+  el("anchor-set-btn").disabled = !State.albumHandle;
+  el("anchor-clear-btn").disabled = !State.albumAnchorHandle;
+}
+
+// режим просмотра готовых альбомов: дерево слева временно заменяется плоским списком
+// папок "…-Albom" (найденных findAlbumFolders на любой глубине). Строки — те же
+// createFolderNode, что и в обычном дереве, поэтому открытие/переименование/двойной клик
+// в Проводник работают одинаково и там, и там
+async function renderAlbumsView() {
+  const container = el("folder-tree");
+  container.innerHTML = "<p class=\"albums-list-empty\">Поиск…</p>";
+  pushBusyCursor();
+  try {
+    // findAlbumFolders обходит дерево заново и по пути сама заполняет folderParents
+    // (см. её реализацию) — поэтому карты сбрасываем перед вызовом, как и buildFolderTree
+    State.folderRows = new Map();
+    State.folderParents = new Map();
+    State.folderExpanders = new Map();
+    State.folderChildren = new Map();
+    const albums = await findAlbumFolders();
+    container.innerHTML = "";
+    if (albums.length === 0) {
+      container.innerHTML = "<p class=\"albums-list-empty\">Папки «…-Albom» не найдены</p>";
+      return;
+    }
+    const list = document.createElement("ul");
+    list.className = "folder-tree-list";
+    for (const album of albums) {
+      list.appendChild(await createFolderNode(album.handle));
+    }
+    container.appendChild(list);
+  } finally {
+    popBusyCursor();
+  }
+}
+
+async function toggleAlbumsView() {
+  if (!State.rootHandle) return;
+  if (!State.albumsViewActive) {
+    State.albumsViewActive = true;
+    el("albums-list-btn").classList.add("active");
+    await renderAlbumsView();
+    return;
+  }
+  State.albumsViewActive = false;
+  el("albums-list-btn").classList.remove("active");
+  // путь берём ДО перестройки дерева (buildFolderTree сбрасывает folderParents) — на этот
+  // момент карта ещё та, что построил findAlbumFolders внутри renderAlbumsView, и в ней уже
+  // есть цепочка предков и для альбома, открытого кликом по строке списка альбомов
+  const activePath = State.albumHandle ? folderNamePath(State.albumHandle) : [];
+  State.treeBuildPromise = buildFolderTree(State.rootHandle).catch((e) => console.error("Ошибка построения дерева папок", e));
+  await State.treeBuildPromise;
+  const target = await expandTreeToPath(activePath);
+  const row = State.folderRows.get(target);
+  if (row) highlightFolderRow(row);
+}
+
+// путь, который пользователь вручную набрал/поправил в настройках — тот же путь, что раньше
+// спрашивался всплывающим prompt() только при первом клике "Открыть в Проводнике" (см.
+// ensureRootAbsolutePath), теперь его можно увидеть и поменять в любой момент
+async function saveRootAbsolutePathFromInput() {
+  if (!State.rootHandle) return;
+  const input = el("root-path-input");
+  const path = input.value.replace(/[\\/]+$/, "");
+  State.rootAbsolutePath = path || null;
+  input.value = State.rootAbsolutePath || "";
+  try {
+    await idbSet("rootAbsolutePath", State.rootAbsolutePath);
+    await idbSet("rootAbsolutePathName", State.rootHandle.name);
+  } catch (_) {
+    // необязательная удобная фича
+  }
+}
 
 // перетаскиваемая граница между панелями: sign=1, если targetEl — первая (левая/верхняя)
 // панель у разделителя (растёт в сторону движения), sign=-1 — если вторая (растёт в обратную)
@@ -3400,10 +3695,47 @@ function init() {
   }
   syncPreviewPanelButtons();
 
+  // порядок папок в дереве слева — по умолчанию "сначала новые" (State.folderSortMode),
+  // выбор запоминается между сеансами; смена варианта перестраивает дерево целиком (дёшево:
+  // buildFolderTree подгружает только корень, вложенные узлы — лениво по клику, как обычно)
+  const savedSortMode = localStorage.getItem(FOLDER_SORT_STORAGE_KEY);
+  if (savedSortMode) State.folderSortMode = savedSortMode;
+  el("folder-sort-select").value = State.folderSortMode;
+  el("folder-sort-select").addEventListener("change", async (evt) => {
+    State.folderSortMode = evt.target.value;
+    localStorage.setItem(FOLDER_SORT_STORAGE_KEY, State.folderSortMode);
+    evt.target.blur(); // без этого выбранный option оставляет вокруг select синее кольцо фокуса, будто кнопка залипла
+    if (State.albumsViewActive) {
+      // список альбомов всегда по алфавиту — порядок папок его не касается, поэтому смена
+      // сортировки просто возвращает обычное дерево (уже в новом порядке)
+      await toggleAlbumsView();
+      return;
+    }
+    if (State.rootHandle) {
+      // перестройка дерева сбрасывает раскрытые узлы к одному корню — сразу же раскрываем его
+      // обратно до текущего открытого альбома (folderNamePath/expandTreeToPath — тот же приём,
+      // что и restoreFocusInTree при старте), чтобы пользователь не терял место в дереве
+      const activePath = State.albumHandle ? folderNamePath(State.albumHandle) : [];
+      State.treeBuildPromise = buildFolderTree(State.rootHandle).catch((e) => console.error("Ошибка построения дерева папок", e));
+      await State.treeBuildPromise;
+      const target = await expandTreeToPath(activePath);
+      const row = State.folderRows.get(target);
+      if (row) highlightFolderRow(row);
+    }
+  });
+
   el("settings-btn").addEventListener("click", openAboutModal);
   el("about-close-btn").addEventListener("click", closeAboutModal);
   el("about-modal").addEventListener("click", (evt) => {
     if (evt.target.id === "about-modal") closeAboutModal();
+  });
+
+  el("albums-list-btn").addEventListener("click", toggleAlbumsView);
+  el("anchor-set-btn").addEventListener("click", () => setAlbumAnchor(State.albumHandle));
+  el("anchor-clear-btn").addEventListener("click", clearAlbumAnchor);
+  el("root-path-input").addEventListener("blur", saveRootAbsolutePathFromInput);
+  el("root-path-input").addEventListener("keydown", (evt) => {
+    if (evt.key === "Enter") { evt.preventDefault(); el("root-path-input").blur(); }
   });
 
   // "Установить на рабочий стол" — сама кнопка живёт всегда (см. правило про disabled вместо
@@ -3445,12 +3777,14 @@ function init() {
   });
   el("properties-map-btn").addEventListener("click", toggleEmbeddedMap);
   el("properties-map-new-btn").addEventListener("click", toggleLocationMapWindow);
-  // сообщения из отдельного окна map.html: готовность к получению точек альбома, либо клик
-  // по карте, задающий геопривязку текущего фото
+  el("globe-btn").addEventListener("click", toggleGlobeWindow);
+  // сообщения из отдельных окон map.html/globe.html: готовность к получению точек альбома,
+  // либо клик по карте/капле/глобусу — переход к фото или геопривязка (только у карты —
+  // глобус координаты кликом не проставляет)
   window.addEventListener("message", (e) => {
-    if (e.source !== State.mapWindow) return;
+    if (e.source !== State.mapWindow && e.source !== State.globeWindow) return;
     const data = e.data || {};
-    if (data.type === "map-ready") {
+    if (data.type === "map-ready" || data.type === "globe-ready") {
       refreshMaps();
       return;
     }
@@ -3458,7 +3792,9 @@ function init() {
       goToPhoto(data.focusIndex);
       return;
     }
-    if (typeof data.lat === "number" && typeof data.lon === "number") setCurrentGeo(data.lat, data.lon);
+    if (e.source === State.mapWindow && typeof data.lat === "number" && typeof data.lon === "number") {
+      setCurrentGeo(data.lat, data.lon);
+    }
   });
 
   el("open-album-btn").addEventListener("click", pickAlbum);
@@ -3502,6 +3838,7 @@ function init() {
   el("prev-btn").addEventListener("click", prevPhoto);
   el("next-btn").addEventListener("click", nextPhoto);
   el("save-btn").addEventListener("click", saveCurrent);
+  el("delete-btn").addEventListener("click", deleteCurrentPhoto);
   el("slideshow-btn").addEventListener("click", toggleSlideshow);
   el("fullscreen-btn").addEventListener("click", toggleFullscreenBtn);
   el("toggle-left-btn").addEventListener("click", toggleLeftPanel);
@@ -3511,19 +3848,21 @@ function init() {
   document.addEventListener("keydown", onViewerKeydown);
   // настоящее изменение размера окна браузера (в т.ч. и то, которым сопровождается сам вход
   // в fullscreen/выход из него — оно может занять больше кадра, поэтому это ещё и подстраховка
-  // для onFullscreenChange) — а не перетаскивание внутренних разделителей панелей: те двигают
-  // только свои элементы через inline-стили и это событие не поднимают, так что фотография
-  // по-прежнему не ужимается вживую при перетаскивании границ панелей
-  window.addEventListener("resize", () => fitPreviewToWindow());
+  // для onFullscreenChange) — перетаскивание внутренних разделителей панелей это событие не
+  // поднимает (см. makeResizable — те двигают только свои элементы через inline-стили), поэтому
+  // у них ниже свой отдельный вызов fitPreviewToWindowInstant через onResize
+  window.addEventListener("resize", () => { fitPreviewToWindow(); updateThumbSizing(); });
 
   makeResizable(el("resizer-vertical"), el("left-column"), "x", {
-    sign: 1, storageKey: "folderTreeWidth",
+    sign: 1, storageKey: "folderTreeWidth", onResize: fitPreviewToWindowInstant,
   });
   makeResizable(el("resizer-horizontal"), el("album-grid"), "y", {
-    sign: -1, storageKey: "albumGridHeight", onResize: updateThumbSizing,
+    sign: -1, storageKey: "albumGridHeight",
+    onResize: () => { updateThumbSizing(); fitPreviewToWindowInstant(); },
   });
   makeResizable(el("resizer-right"), el("album-grid"), "x", {
-    sign: -1, min: 120, max: 2000, storageKey: "albumGridWidth", onResize: updateThumbSizing,
+    sign: -1, max: 2000, storageKey: "albumGridWidth",
+    onResize: () => { updateThumbSizing(); fitPreviewToWindowInstant(); },
   });
   // ширина ленты (только что восстановленная выше из localStorage через storageKey) имеет
   // смысл только в боковом режиме — в нижнем лента и так растягивается на всю ширину через
@@ -3559,13 +3898,19 @@ function init() {
   }, { passive: false });
 
   el("album-grid").addEventListener("wheel", (evt) => {
-    if (evt.deltaY === 0) return;
+    if (evt.deltaX === 0 && evt.deltaY === 0) return;
     evt.preventDefault();
     const grid = el("album-grid");
-    if (document.body.classList.contains("panel-right")) {
-      grid.scrollTop += evt.deltaY;
+    // позиция в альбоме листается по той оси, у которой сейчас есть прокрутка: в нижнем режиме
+    // и в боковом многостолбцовом — это scrollLeft (столбцы растянуты на всю высоту ленты,
+    // движение происходит между ними по горизонтали); в боковом одностолбцовом (.single-column,
+    // см. updateColumnMode()) — обычный список, там прокрутка вертикальная, scrollTop. Обычное
+    // колесо мыши (deltaY) и горизонтальный свайп/колесо (deltaX) одинаково листают альбом — вне
+    // зависимости от того, каким физически было движение, они складываются в одну актуальную ось.
+    if (grid.classList.contains("single-column")) {
+      grid.scrollTop += evt.deltaY + evt.deltaX;
     } else {
-      grid.scrollLeft += evt.deltaY;
+      grid.scrollLeft += evt.deltaY + evt.deltaX;
     }
   }, { passive: false });
 

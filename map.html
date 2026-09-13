@@ -41,7 +41,8 @@
   let points = [];
   let activeIndex = -1;
   let copyMode = false; // режим редактирования параметров в главном окне — без него клик по фону карты ничего не делает
-  let lastPointsSignature = null; // меняем вид карты только когда меняются сами точки, не при смене фокуса
+  let lastPointsSignature = null; // общий обзор пересчитываем только когда меняется сам набор точек, не каждый рендер
+  let lastFocusKey = null; // и подводим вид к капле только когда реально сменилось сфокусированное фото, а не при каждом обновлении (например, фоновом досканировании GPS остальных фото альбома)
 
   function ensureMap() {
     if (map) return map;
@@ -66,10 +67,12 @@
     return pts.map((p) => (p ? p.lat.toFixed(6) + "," + p.lon.toFixed(6) : "")).join(";");
   }
 
-  // отдельное окно карты — это обзор всего альбома: масштаб выставляется один раз на все
-  // известные точки и дальше не дёргается при смене сфокусированного фото, только подсветка
-  // капли меняется; вид пересчитывается заново лишь если поменялся сам набор точек
-  // (например докрутился фоновый скан GPS альбома)
+  // отдельное окно карты — так же, как встроенная карта в панели параметров (см.
+  // refreshEmbeddedMapMarkers в app.js): пока у сфокусированного фото есть геоданные, вид
+  // подводится к его капле; иначе — общий обзор всех известных точек альбома. Подводить вид
+  // нужно только когда смена фокуса настоящая (сменилось фото или у него появились
+  // координаты), а не при каждом вызове render() — иначе фоновое досканирование GPS
+  // остальных фото альбома дёргало бы карту, даже если пользователь остаётся на одном фото
   function render() {
     const m = ensureMap();
     syncGeoMarkers(L, m, markersRef, points, activeIndex, (indexes) => {
@@ -77,13 +80,18 @@
         window.opener.postMessage({ focusIndex: pickClusterTarget(indexes, activeIndex) }, "*");
       }
     });
+    const cur = points[activeIndex];
+    const focusKey = cur ? `${activeIndex}:${cur.lat.toFixed(6)},${cur.lon.toFixed(6)}` : `none:${activeIndex}`;
+    if (focusKey !== lastFocusKey) {
+      lastFocusKey = focusKey;
+      if (cur) m.setView([cur.lat, cur.lon], 16);
+    }
     const known = points.filter(Boolean);
     const sig = pointsSignature(points);
     if (sig !== lastPointsSignature) {
       lastPointsSignature = sig;
-      if (known.length) m.fitBounds(L.latLngBounds(known.map((p) => [p.lat, p.lon])).pad(0.2));
+      if (!cur && known.length) m.fitBounds(L.latLngBounds(known.map((p) => [p.lat, p.lon])).pad(0.2));
     }
-    const cur = points[activeIndex];
     document.getElementById("hint").hidden = !copyMode || !!cur;
     document.title = cur ? `Место съёмки (${cur.lat.toFixed(5)}, ${cur.lon.toFixed(5)}) — Albom` : "Место съёмки — Albom";
     requestAnimationFrame(() => m.invalidateSize());

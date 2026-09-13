@@ -23,6 +23,13 @@
       <button id="open-album-btn" title="Открыть альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
       <button id="continue-album-btn" hidden title="Продолжить последний альбом"><img src="icons/Folder Open WIT.png" alt=""></button>
       <button id="settings-btn" title="О программе"><img src="icons/Gear WIT.png" alt=""></button>
+      <select id="folder-sort-select" class="folder-sort-select" title="Порядок папок в дереве">
+        <option value="date-desc">Сначала новые</option>
+        <option value="date-asc">Сначала старые</option>
+        <option value="name-asc">Имя А→Я</option>
+        <option value="name-desc">Имя Я→А</option>
+      </select>
+      <button id="albums-list-btn" title="Список готовых альбомов" disabled><img src="icons/Albom WIT.png" alt=""></button>
     </div>
     <div id="folder-tree"></div>
     <div id="properties-panel">
@@ -37,6 +44,7 @@
       <div id="properties-map-buttons" class="properties-map-buttons">
         <button id="properties-map-btn" title="Показать карту" disabled><img src="icons/Map WIT.png" alt=""></button>
         <button id="properties-map-new-btn" title="Показать карту в новом окне" disabled><img src="icons/Map Window WIT.png" alt=""></button>
+        <button id="globe-btn" title="Показать альбом на глобусе" disabled><img src="icons/Globe WIT.png" alt=""></button>
         <button id="properties-edit-btn" title="Режим редактирования параметров"><img src="icons/Edit WIT.png" alt=""></button>
       </div>
     </div>
@@ -58,6 +66,7 @@
       <button id="fullscreen-btn" class="svg-icon-btn" title="Полный экран" disabled>
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 5V1h4"/><path d="M11 1h4v4"/><path d="M1 11v4h4"/><path d="M15 11v4h-4"/></svg>
       </button>
+      <button id="slideshow-btn" title="Слайдшоу (полный экран)" disabled><img src="icons/Basket WIT.png" alt=""></button>
     </div>
 
     <div id="canvas-row">
@@ -99,12 +108,10 @@
       <button id="color-btn" title="Цветокоррекция" disabled><img src="icons/Palette WIT.png" alt=""></button>
       <button id="restore-btn" title="Восстановить оригинал" disabled><img src="icons/Back WIT.png" alt=""></button>
       <button id="star-btn" title="Добавить в альбом" disabled><img src="icons/Star WIT.png" alt=""></button>
-      <button id="slideshow-btn" class="svg-icon-btn" title="Слайдшоу (полный экран)" disabled>
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1" y="2.5" width="14" height="11" rx="1.5"/><path d="M6.2 5.8v4.4l4.2-2.2z" fill="currentColor" stroke="none"/></svg>
-      </button>
+      <button id="save-btn" title="Сохранить в альбом" disabled><img src="icons/Save WIIT.png" alt=""></button>
+      <button id="delete-btn" title="Удалить (переместить в папку «Deleted» в корне альбома)" disabled><img src="icons/Delit WIT.png" alt=""></button>
       <button id="prev-btn" title="Предыдущее" disabled>◀</button>
       <button id="next-btn" title="Следующее" disabled>▶</button>
-      <button id="save-btn" title="Сохранить" disabled><img src="icons/Save WIIT.png" alt=""></button>
     </div>
   </main>
 </div>
@@ -127,6 +134,18 @@
     <hr class="about-divider">
     <p class="about-install-hint">Приложение работает через локальный сервер — перед запуском установленного ярлыка убедитесь, что <code>start.bat</code> запущен.</p>
     <p class="about-credits">Сделано на основе открытых инструментов: <a href="https://docs.opencv.org/4.9.0/d5/d10/tutorial_js_root.html" target="_blank" rel="noopener">OpenCV.js</a> (поиск линий горизонта), File System Access API, шрифт — Google Fonts (Poppins).</p>
+    <label class="about-path-row" title="File System Access API не даёт настоящих путей на диске сам по себе — путь к открытому альбому храним отдельно, вручную (нужен для кнопки «Открыть в Проводнике» и для папки «Deleted»)">
+      Путь к альбому на диске
+      <input type="text" id="root-path-input" class="about-path-input" placeholder="—" disabled>
+    </label>
+    <label class="about-path-row" title="Общая папка для «-Albom» и «Deleted» — не зависит от того, какая подпапка сейчас открыта. Не закреплено — поведение как раньше: своя «-Albom» на каждую открытую подпапку.">
+      Опорная папка альбома
+      <input type="text" id="anchor-path-input" class="about-path-input" placeholder="— (как открытая папка)" disabled>
+    </label>
+    <div class="about-anchor-buttons">
+      <button id="anchor-set-btn" class="text-btn" disabled>Закрепить текущую папку</button>
+      <button id="anchor-clear-btn" class="text-btn" disabled>Сбросить</button>
+    </div>
     <button id="install-btn" class="text-btn about-install-btn" title="Установить на рабочий стол" disabled>
       <img src="icons/icon-32.png" alt="">
       Установить на рабочий стол

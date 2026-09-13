@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Глобус альбома — Albom</title>
+<link rel="icon" href="icons/Globe WIT.png">
+<style>
+  html, body, #globeViz { margin: 0; height: 100%; background: #000; overflow: hidden; }
+
+  /* та же капля с числом кадров, что и на плоской карте (map.html/style.css) — единый вид меток */
+  .geo-pin-icon { background: transparent; border: none; }
+  .geo-pin-wrap { display: flex; flex-direction: column; align-items: center; pointer-events: auto; cursor: pointer; }
+  .geo-pin {
+    width: 22px; height: 22px; border-radius: 50% 50% 50% 0; background: #4a90d9;
+    border: 2px solid #fff; transform: rotate(-45deg); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  }
+  .geo-pin-num {
+    margin-top: 2px; font: 600 11px/1 system-ui, sans-serif; color: #fff;
+    background: rgba(27, 27, 31, 0.75); border-radius: 3px; padding: 1px 4px;
+  }
+  .geo-pin-wrap.active .geo-pin { background: #ffb400; width: 28px; height: 28px; }
+  .geo-pin-wrap.active .geo-pin-num { background: #ffb400; color: #1b1b1f; font-weight: 700; }
+</style>
+</head>
+<body>
+<div id="globeViz"></div>
+<script src="https://unpkg.com/globe.gl"></script>
+<script src="geo-markers.js"></script>
+<script>
+  let points = [];
+  let activeIndex = -1;
+  let lastPointsSignature = null; // общий обзор пересчитываем только когда меняется сам набор точек, не каждый рендер
+  let lastFocusKey = null; // и подводим камеру к капле только когда реально сменилось сфокусированное фото
+
+  // Инициализация — один в один с travel-globe/app.js (см. план): локальная 8k-текстура
+  // Земли вместо дефолтной низкодетальной из three-globe, анизотропная фильтрация после
+  // асинхронной загрузки текстуры, автовращение, ручной ресайз канваса под контейнер.
+  const globe = Globe()(document.getElementById("globeViz"))
+    .globeImageUrl("textures/earth-daymap-8k.jpg")
+    .bumpImageUrl("https://unpkg.com/three-globe/example/img/earth-topology.png")
+    .backgroundImageUrl("https://unpkg.com/three-globe/example/img/night-sky.png")
+    .htmlElementsData([])
+    .htmlLat("lat")
+    .htmlLng("lon")
+    .htmlElement((c) => {
+      const wrap = document.createElement("div");
+      wrap.className = "geo-pin-wrap" + (c.indexes.includes(activeIndex) ? " active" : "");
+      wrap.innerHTML = `<div class="geo-pin"></div><div class="geo-pin-num">${c.indexes.length}</div>`;
+      wrap.style.pointerEvents = "auto";
+      wrap.onclick = (e) => {
+        e.stopPropagation();
+        if (window.opener && !window.opener.closed) {
+          window.opener.postMessage({ focusIndex: pickClusterTarget(c.indexes, activeIndex) }, "*");
+        }
+      };
+      return wrap;
+    });
+
+  globe.renderer().setPixelRatio(window.devicePixelRatio);
+  const sharpenGlobeTextureInterval = setInterval(() => {
+    const globeTexture = globe.globeMaterial().map;
+    if (globeTexture) {
+      globeTexture.anisotropy = globe.renderer().capabilities.getMaxAnisotropy();
+      globeTexture.needsUpdate = true;
+      clearInterval(sharpenGlobeTextureInterval);
+    }
+  }, 100);
+
+  globe.controls().autoRotate = true;
+  globe.controls().autoRotateSpeed = 0.4;
+
+  const globeVizEl = document.getElementById("globeViz");
+  function resizeGlobe() {
+    globe.width(globeVizEl.clientWidth);
+    globe.height(globeVizEl.clientHeight);
+  }
+  window.addEventListener("resize", resizeGlobe);
+  new ResizeObserver(resizeGlobe).observe(globeVizEl);
+
+  function pointsSignature(pts) {
+    return pts.map((p) => (p ? p.lat.toFixed(6) + "," + p.lon.toFixed(6) : "")).join(";");
+  }
+
+  // рендер — как в map.html: пересобираем капли текущего альбома и подводим камеру к
+  // сфокусированной либо к общему обзору всех точек, но только когда это реально меняется
+  function render() {
+    const clusters = clusterGeoPoints(points);
+    globe.htmlElementsData(clusters);
+    const cur = points[activeIndex];
+    const focusKey = cur ? `${activeIndex}:${cur.lat.toFixed(6)},${cur.lon.toFixed(6)}` : `none:${activeIndex}`;
+    if (focusKey !== lastFocusKey) {
+      lastFocusKey = focusKey;
+      if (cur) globe.pointOfView({ lat: cur.lat, lng: cur.lon, altitude: 1.5 }, 1000);
+    }
+    const known = points.filter(Boolean);
+    const sig = pointsSignature(points);
+    if (sig !== lastPointsSignature) {
+      lastPointsSignature = sig;
+      if (!cur && known.length) {
+        const lat = known.reduce((s, p) => s + p.lat, 0) / known.length;
+        const lng = known.reduce((s, p) => s + p.lon, 0) / known.length;
+        globe.pointOfView({ lat, lng, altitude: 2 }, 1000);
+      }
+    }
+    document.title = cur ? `Глобус (${cur.lat.toFixed(5)}, ${cur.lon.toFixed(5)}) — Albom` : "Глобус альбома — Albom";
+  }
+
+  window.addEventListener("message", (e) => {
+    if (e.source !== window.opener) return;
+    const data = e.data || {};
+    if (!Array.isArray(data.points)) return;
+    points = data.points;
+    activeIndex = data.activeIndex;
+    render();
+  });
+
+  // сигнализируем главному окну, что можно присылать данные — открытие окна и первое
+  // postMessage от opener'а иначе могут обогнать подписку на "message" здесь
+  if (window.opener && !window.opener.closed) {
+    window.opener.postMessage({ type: "globe-ready" }, "*");
+  }
+</script>
+</body>
+</html>

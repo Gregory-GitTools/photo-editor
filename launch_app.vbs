@@ -9,11 +9,17 @@ Set shell = CreateObject("WScript.Shell")
 shell.CurrentDirectory = scriptDir
 
 ' проверяем, не запущен ли уже сервер (иначе при повторном запуске плодили бы процессы)
-Set portCheck = shell.Exec("cmd /c netstat -ano | findstr "":8642 "" | findstr LISTENING")
-Do While portCheck.Status = 0
-    WScript.Sleep 50
-Loop
-portBusy = Not portCheck.StdOut.AtEndOfStream
+' используем Run (не Exec) с скрытым окном и выводом во временный файл — у Exec нет
+' способа скрыть его консольное окно, из-за чего при каждом запуске мелькало чёрное окно
+tempFile = shell.ExpandEnvironmentStrings("%TEMP%") & "\albom_port_check.txt"
+shell.Run "cmd /c netstat -ano | findstr "":8642 "" | findstr LISTENING > """ & tempFile & """", 0, True
+portBusy = False
+If fso.FileExists(tempFile) Then
+    Set portCheckFile = fso.OpenTextFile(tempFile, 1)
+    portBusy = Not portCheckFile.AtEndOfStream
+    portCheckFile.Close
+    fso.DeleteFile tempFile
+End If
 
 If Not portBusy Then
     shell.Run "cmd /c python server.py", 0, False

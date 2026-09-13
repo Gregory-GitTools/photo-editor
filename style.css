@@ -27,6 +27,12 @@ body {
 
 body.resizing { user-select: none; }
 
+/* пересканирование большой папки на диске (перестройка/раскрытие дерева слева) может занять
+   заметное время — курсор-ожидание вместо тишины сообщает, что приложение работает, а не
+   зависло; !important и селектор на все потомки — иначе элементы со своим cursor
+   (кнопки, ссылки в дереве) переопределили бы это состояние */
+body.busy-cursor, body.busy-cursor * { cursor: wait !important; }
+
 button {
   background: #35353d;
   color: var(--text);
@@ -115,6 +121,12 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   object-fit: contain;
 }
 
+/* исходный файл нарисован остриём стрелки вправо/вниз ("вперёд") — для смысла
+   "восстановить оригинал" нужна стрелка влево/назад, зеркалим по горизонтали в CSS */
+#restore-btn img {
+  transform: scaleX(-1);
+}
+
 .folder-toolbar button svg,
 .toolbar button svg {
   width: 68%;
@@ -136,6 +148,12 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   padding: 10px 12px;
   background: var(--panel);
   min-height: 0;
+  /* без границы между деревом и параметрами рост этой панели (после открытия альбома) просто
+     сжимал #folder-tree (flex: 1 1 auto) на свою высоту — уже раскрытая/проскроленная папка
+     внизу дерева оказывалась вытеснена этим ростом. Отдельный max-height не даёт панели расти
+     бесконечно за счёт дерева — вместо этого её собственное содержимое (например, карта
+     геометок) само уходит во внутреннюю прокрутку */
+  max-height: 45vh;
 }
 
 #properties-heading {
@@ -329,6 +347,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   align-items: center;
   gap: 4px;
   padding: 0 6px;
+  margin-bottom: 2px;
   border-radius: 4px;
   cursor: pointer;
 }
@@ -369,6 +388,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   padding: 0 3px;
   width: 100%;
   min-width: 60px;
+}
+
+.folder-rename-input:focus {
+  outline: none;
 }
 
 #editor-pane {
@@ -472,9 +495,8 @@ body.panel-right #canvas-row {
 /* В нижнем режиме — обычная одна строка (flex-direction: row), миниатюры растут по высоте
    ленты и просто уезжают за край, листаются горизонтальной прокруткой (колесо/стрелки —
    см. app.js), как и было изначально.
-   В боковом режиме (panel-right) — обычная сетка (flex-direction: row + wrap): миниатюры
-   заполняют строку слева направо, а когда ширина заканчивается, переносятся на строку ниже
-   ("пачкуются") — лишние миниатюры листаются вертикальной прокруткой. */
+   В боковом режиме (panel-right) — столбцы через flex-wrap (см. ниже): миниатюры идут одна под
+   другой в столбце, а когда столбцов больше одного — слева направо. */
 #album-grid {
   height: 110px;
   flex-shrink: 0;
@@ -484,34 +506,46 @@ body.panel-right #canvas-row {
   background: #19191c;
   display: flex;
   flex-direction: row;
-  gap: 8px;
+  gap: 2px;
 }
 
-/* боковой режим: ровно rightPanelCols столбиков-обёрток (.thumb-col), которые собирает и
-   перекладывает layoutRightColumns() в app.js при каждом пересчёте размеров — они лежат в ряд
-   (сама лента — flex-direction: row), а внутри каждой обёртки миниатюры идут друг под другом
-   (flex-direction: column) в порядке "сверху вниз", как и раньше. Число столбцов тут фиксировано
-   явно (а не через flex-wrap/CSS grid) специально ради того, чтобы миниатюры могли сохранять
-   собственные пропорции кадра (см. .thumb ниже) — при "естественном" переносе по высоте
-   (flex-wrap) миниатюра высотой больше плейсхолдерной легко создала бы лишний, не влезающий по
-   ширине столбец, а он просто обрезался бы overflow-x: hidden вместе с фото в нём */
+/* боковой режим: столбцы через flex-wrap, а не CSS column-width (тот сам растягивает ширину
+   столбика, чтобы не оставалось пустого места сбоку ленты — из-за этого миниатюры переставали
+   уменьшаться при сужении панели: даже когда доступной ширины уже не хватало на два столбика,
+   единственный оставшийся столбик всё ещё растягивался шире 3см, упираясь в max-width, и вместо
+   плавного уменьшения получалась пустая полоса сбоку).
+   Столбец — обычный вертикальный flex (flex-direction: column), а flex-wrap заворачивает в
+   новый столбец, когда очередная миниатюра не помещается по высоте ленты; высота ленты растянута
+   на всю доступную высоту (обычный, ничем не переопределённый stretch от флекс-родителя
+   #canvas-row) — это и есть та высота, по которой flex-wrap считает, когда столбец заполнен.
+   align-content: flex-start — столбцы прижаты к левому краю, лишняя ширина остаётся пустой
+   справа, а не растягивает столбцы (как раньше растягивались колонки в column-width).
+   height: auto перебивает базовое #album-grid { height: 110px } (это высота нижнего режима, сама
+   по себе она никуда не девается в боковом режиме — иначе лента была бы прижата к 110px). Если
+   столбцов больше одного — лишнее уезжает по горизонтали (overflow-x), вертикальной прокрутки
+   в этом режиме не бывает (растянутая высота ленты и есть предел столбца) — overflow-y поэтому
+   спрятан, а не просто пустует, иначе при одностолбцовом режиме (.single-column ниже) успевал
+   бы на миг появиться и горизонтальный, и вертикальный скролл разом. */
 body.panel-right #album-grid {
   height: auto;
-  width: 240px;
-  overflow-x: hidden;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: row;
-  align-items: flex-start;
-  gap: 8px;
-}
-
-.thumb-col {
   display: flex;
   flex-direction: column;
-  flex-shrink: 0;
-  gap: 8px;
-  width: var(--thumb-size, 152px);
+  flex-wrap: wrap;
+  align-content: flex-start;
+  width: 240px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  gap: 2px;
+}
+
+/* если ширины ленты хватает только на один столбец, второй (недоступный) не имеет смысла —
+   вместо обрезанной сетки со скроллом на пару пикселей вправо включаем обычный список в один
+   столбец с вертикальной прокруткой вниз (переключает updateColumnMode() в app.js по факту
+   помещающейся ширины) */
+body.panel-right #album-grid.single-column {
+  flex-wrap: nowrap;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .thumb {
@@ -526,23 +560,29 @@ body.panel-right #album-grid {
   padding: 0;
 }
 
-/* размер миниатюр — единая переменная, которую пересчитывает updateThumbSizing() при
-   перетаскивании границы ленты (--thumb-size задаёт высоту в нижнем режиме, ширину — в
-   боковом; вторая сторона следует из aspect-ratio) — одна и та же формула в обоих режимах */
+/* размер миниатюр в нижнем режиме — переменная, которую пересчитывает updateThumbSizing() при
+   перетаскивании границы ленты (--thumb-size задаёт высоту, ширина следует из aspect-ratio) */
 body:not(.panel-right) .thumb {
   height: var(--thumb-size, 90px);
 }
 
-/* в боковом режиме миниатюра показывает настоящие пропорции кадра (портрет/альбом — вперемешку,
-   как и сняты фото), а не обрезается под общий формат — так удобнее ориентироваться по ленте.
+/* в боковом режиме ширина миниатюры фиксирована — 3см (max-width: 100% — только подстраховка,
+   чтобы миниатюра не вылезала за край, если сама лента вдруг уже, чем 3см; сузить лишь настолько
+   не даёт минимальная ширина перетаскивания resizer-right, но это не повод полагаться на неё
+   здесь). flex: 0 0 auto — ширина не растёт вместе со столбиком (в отличие от прежнего
+   column-width, где столбец мог растягиваться шире 3см) и не сжимается — flex-shrink относится
+   к главной оси столбца (высоте), а высоту каждая миниатюра держит свою, настоящую, без
+   выравнивания. Показывает настоящие пропорции кадра (портрет/альбом — вперемешку, как и сняты
+   фото), а не обрезается под общий формат.
    Пока фото не подгрузилось (нет .loaded на img), высоту держим плейсхолдером 3:4 (тот же, что
    и в base .thumb), чтобы кнопка не схлопывалась в нулевую высоту и лента не прыгала; как
    только реальная картинка подгрузилась — aspect-ratio снимается, и высота идёт от неё самой
    (через img { height: 100% }, которое в этот момент трактуется как auto — у auto-высокого
    родителя проценты по высоте не имеют опоры) */
 body.panel-right .thumb {
-  width: var(--thumb-size, 152px);
-  height: auto;
+  width: 3cm;
+  max-width: 100%;
+  flex: 0 0 auto;
 }
 
 body.panel-right .thumb:has(> img.loaded) {
@@ -551,9 +591,12 @@ body.panel-right .thumb:has(> img.loaded) {
 
 /* пока идёт подбор цветокоррекции, лента временно показывает всего 4 крупные кнопки-варианта
    вместо миниатюр альбома — в боковом режиме их прижимаем к низу ленты (а не к верху, как
-   обычные миниатюры), чтобы не путать с листанием фото */
+   обычные миниатюры), чтобы не путать с листанием фото. База уже даёт обычный flex-column на
+   всю высоту ленты — нужно только отключить перенос в новый столбец (вариантов всего 4, но
+   мало ли что) и подвинуть их к низу */
 body.panel-right #album-grid.color-picker-mode {
-  align-items: flex-end;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
 }
 
 /* ">" — а не просто ".thumb img" — иначе то же правило цепляет и значки-бейджи (звезда,
@@ -685,7 +728,8 @@ body.panel-right #album-grid.color-picker-mode {
   font-size: 1.15rem;
 }
 
-.aspect-control select {
+.aspect-control select,
+.folder-sort-select {
   background: #35353d;
   color: var(--text);
   border: 1px solid #46464f;
@@ -698,9 +742,18 @@ body.panel-right #album-grid.color-picker-mode {
   opacity: 0.4;
 }
 
+.folder-sort-select {
+  margin-left: auto; /* прижимает и сам select, и следующую за ним кнопку "Список альбомов" к правому краю тулбара, подальше от кнопок открытия/настроек */
+  font-size: 0.78rem;
+  max-width: 118px;
+}
+
 /* активность видна по подсвеченной кнопке "рамка обрезки" рядом — свой синий контур
-   фокуса на самом select только дублирует это же состояние и не нужен */
-.aspect-control select:focus {
+   фокуса на самом select только дублирует это же состояние и не нужен. У folder-sort-select
+   такого дублирующего индикатора нет, но кольцо фокуса всё равно снимаем (после выбора JS
+   сам снимает фокус с select) — иначе он выглядит "залипшим" после выбора варианта */
+.aspect-control select:focus,
+.folder-sort-select:focus {
   outline: none;
 }
 
@@ -790,6 +843,40 @@ body.panel-right #album-grid.color-picker-mode {
   padding: 1px 5px;
 }
 
+.about-path-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0 0 12px;
+}
+
+.about-path-input {
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: #1b1b1f;
+  border: 1px solid #3a3a42;
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+
+.about-path-input:not(:disabled):focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.about-anchor-buttons {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.about-anchor-buttons .text-btn {
+  flex: 1;
+}
+
 .about-install-btn {
   width: 100%;
   display: flex;
@@ -832,6 +919,11 @@ body.panel-right #album-grid.color-picker-mode {
   color: #1b1b1f;
   border-color: var(--accent);
   font-weight: 600;
+}
+
+.albums-list-empty {
+  color: var(--muted);
+  padding: 8px 6px;
 }
 
 .modal-close {
