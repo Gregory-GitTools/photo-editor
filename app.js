@@ -3533,6 +3533,9 @@ async function toggleAlbumsView() {
   if (!State.albumsViewActive) {
     State.albumsViewActive = true;
     el("albums-list-btn").classList.add("active");
+    // глобус показывает геоточки только текущего альбома, а не всех сразу — в списке
+    // готовых альбомов "текущего альбома" в этом смысле нет, поэтому кнопку блокируем
+    el("globe-btn").disabled = true;
     await renderAlbumsView();
     return;
   }
@@ -3547,6 +3550,10 @@ async function toggleAlbumsView() {
   const target = await expandTreeToPath(activePath);
   const row = State.folderRows.get(target);
   if (row) highlightFolderRow(row);
+  // если пользователь не кликал по строке альбома в списке, openAlbum() не вызывался и
+  // State.index остался тем же, что и до входа в список — просто возвращаем кнопку в то
+  // состояние, которое отражает текущее фото (см. setMapButtonsEnabled)
+  el("globe-btn").disabled = State.index < 0;
 }
 
 // путь, который пользователь вручную набрал/поправил в настройках — тот же путь, что раньше
