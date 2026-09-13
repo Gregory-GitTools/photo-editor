@@ -134,18 +134,10 @@
     <hr class="about-divider">
     <p class="about-install-hint">Приложение работает через локальный сервер — перед запуском установленного ярлыка убедитесь, что <code>start.bat</code> запущен.</p>
     <p class="about-credits">Сделано на основе открытых инструментов: <a href="https://docs.opencv.org/4.9.0/d5/d10/tutorial_js_root.html" target="_blank" rel="noopener">OpenCV.js</a> (поиск линий горизонта), File System Access API, шрифт — Google Fonts (Poppins).</p>
-    <label class="about-path-row" title="File System Access API не даёт настоящих путей на диске сам по себе — путь к открытому альбому храним отдельно, вручную (нужен для кнопки «Открыть в Проводнике» и для папки «Deleted»)">
-      Путь к альбому на диске
+    <label class="about-path-row" title="Папка, выбранная через «Открыть альбом» — общий родитель для всех альбомов внутри неё, для папки «Deleted» и (вручную) для абсолютного пути на диске, нужного кнопке «Открыть в Проводнике». File System Access API не даёт настоящих путей на диске сам по себе, поэтому абсолютный путь ниже задаётся вручную.">
+      Путь к папке альбомов
       <input type="text" id="root-path-input" class="about-path-input" placeholder="—" disabled>
     </label>
-    <label class="about-path-row" title="Общая папка для «-Albom» и «Deleted» — не зависит от того, какая подпапка сейчас открыта. Не закреплено — поведение как раньше: своя «-Albom» на каждую открытую подпапку.">
-      Опорная папка альбома
-      <input type="text" id="anchor-path-input" class="about-path-input" placeholder="— (как открытая папка)" disabled>
-    </label>
-    <div class="about-anchor-buttons">
-      <button id="anchor-set-btn" class="text-btn" disabled>Закрепить текущую папку</button>
-      <button id="anchor-clear-btn" class="text-btn" disabled>Сбросить</button>
-    </div>
     <button id="install-btn" class="text-btn about-install-btn" title="Установить на рабочий стол" disabled>
       <img src="icons/icon-32.png" alt="">
       Установить на рабочий стол

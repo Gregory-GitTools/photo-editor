@@ -867,16 +867,6 @@ body.panel-right #album-grid.color-picker-mode {
   border-color: var(--accent);
 }
 
-.about-anchor-buttons {
-  display: flex;
-  gap: 8px;
-  margin: 0 0 12px;
-}
-
-.about-anchor-buttons .text-btn {
-  flex: 1;
-}
-
 .about-install-btn {
   width: 100%;
   display: flex;

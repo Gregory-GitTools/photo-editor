@@ -47,9 +47,7 @@ const State = {
   albumHandle: null,
   originalsHandle: null, // создаётся лениво, только при первом сохранении
   curatedHandle: null, // папка "<альбом>-Albom" — создаётся лениво при первой звёздочке/сохранении
-  deletedHandle: null, // папка DELETED_DIR в корне альбома (State.rootHandle) — создаётся лениво при первом удалении
-  albumAnchorHandle: null, // явно закреплённая пользователем папка — общий родитель для "-Albom" и "Deleted"
-                            // независимо от текущей открытой подпапки; null = поведение как раньше (см. ensureCuratedHandle/ensureDeletedHandle)
+  deletedHandle: null, // папка DELETED_DIR в «Папке альбомов» (State.rootHandle) — создаётся лениво при первом удалении
   curatedDirName: null, // реальное имя этой папки на диске (см. scanFiles — переживает переименование родителя)
   queue: [], // [{name, handle, edited, starred, thumbUrl}]
   index: -1,
@@ -194,13 +192,11 @@ async function pickAlbum() {
     if (e.name !== "AbortError") setStatus("status-bar", "Не удалось выбрать папку: " + e.message);
     return;
   }
-  State.rootHandle = null; // новый ручной выбор — новый корень дерева слева
-  State.albumAnchorHandle = null; // старый анкор принадлежал прошлому дереву — в новом невалиден
+  State.rootHandle = null; // новый ручной выбор — новый корень дерева слева и новая «Папка альбомов» (см. openAlbum)
   // путь до сфокусированного альбома сбрасываем именно здесь (а не в openAlbum) — там же
   // проходит и восстановление сессии при запуске, которое не должно затирать сохранённый путь
   try {
     await idbSet("lastFocusedPath", []);
-    await idbSet("albumAnchorPath", null);
   } catch (_) {
     // необязательная удобная фича
   }
@@ -214,7 +210,6 @@ async function openAlbum(handle) {
   State.curatedHandle = null;
   State.curatedDirName = null; // реальное имя папки "-Albom" на диске — узнаём при сканировании
   el("continue-album-btn").hidden = true;
-  refreshAnchorUi(); // "Закрепить текущую папку" становится доступна, как только что-то открыто
 
   if (!State.rootHandle) {
     State.rootHandle = handle;
@@ -657,7 +652,7 @@ async function loadSavedRootAbsolutePath() {
 
 async function ensureRootAbsolutePath() {
   if (await loadSavedRootAbsolutePath()) return State.rootAbsolutePath;
-  const input = prompt(`Открытие в Проводнике: укажите полный путь на диске к папке "${State.rootHandle.name}" (спрашивается один раз для этого альбома).`, "");
+  const input = prompt(`Открытие в Проводнике: укажите полный путь на диске к папке "${State.rootHandle.name}" (спрашивается один раз для этой папки альбомов).`, "");
   if (!input) return null;
   State.rootAbsolutePath = input.replace(/[\\/]+$/, "");
   try {
@@ -799,7 +794,6 @@ async function tryRestoreLastAlbum() {
     State.rootHandle = null;
     await openAlbum(handle);
     await restoreFocusInTree();
-    await restoreAlbumAnchor();
     return;
   }
 
@@ -814,7 +808,6 @@ async function tryRestoreLastAlbum() {
         State.rootHandle = null;
         await openAlbum(handle);
         await restoreFocusInTree();
-        await restoreAlbumAnchor();
       } else {
         setStatus("status-bar", "Доступ к папке не разрешён.");
       }
@@ -852,33 +845,6 @@ async function restoreFocusInTree() {
   await openAlbum(target);
 }
 
-// анкор хранится как именной путь от корня (см. folderNamePath/expandTreeToPath), а не
-// отдельный handle со своим разрешением доступа — так восстановление не требует второго,
-// независимого от rootHandle запроса permission
-async function restoreAlbumAnchor() {
-  let path;
-  try {
-    path = await idbGet("albumAnchorPath");
-  } catch (_) {
-    return;
-  }
-  // path === [] значит анкор закреплён на самом rootHandle — валидное значение, в отличие
-  // от path === null/undefined ("анкор не закреплён"), поэтому длина пути тут не проверяется
-  if (path == null) return;
-  const target = await expandTreeToPath(path);
-  if (!target) return;
-  State.albumAnchorHandle = target;
-  refreshAnchorUi();
-  // альбом мог уже быть просканирован (openAlbum вызывался раньше, до восстановления анкора,
-  // см. tryRestoreLastAlbum) — пересканируем, чтобы звёздочки/curatedDirName учли анкор сразу
-  if (State.albumHandle) {
-    State.curatedHandle = null;
-    State.curatedDirName = null;
-    await scanFiles();
-    if (State.queue.length > 0) buildGrid();
-  }
-}
-
 async function scanFiles() {
   setStatus("status-bar", "Сканирую альбом...");
   const imageRe = /\.(jpe?g|png)$/i;
@@ -888,11 +854,12 @@ async function scanFiles() {
   }
   files.sort((a, b) => a.name.localeCompare(b.name));
 
-  // папку "-Albom" ищем не в открытой сейчас подпапке, а в опорной (если она закреплена, см.
-  // State.albumAnchorHandle) — иначе у альбома с камерами по разным подпапкам была бы своя
-  // "-Albom" на каждую подпапку; ищем по факту наличия суффикса, а не по совпадению с именем
-  // родителя — если саму папку альбома переименовали в проводнике, подпапка сохранит старое имя
-  const curatedParent = State.albumAnchorHandle || State.albumHandle;
+  // папку "-Albom" ищем не в открытой сейчас подпапке, а в папке альбома — прямом потомке
+  // «Папки альбомов», содержащем текущую открытую подпапку (см. resolveAlbumFolder) — иначе у
+  // альбома с камерами по разным подпапкам была бы своя "-Albom" на каждую подпапку; ищем по
+  // факту наличия суффикса, а не по совпадению с именем родителя — если саму папку альбома
+  // переименовали в проводнике, подпапка сохранит старое имя
+  const curatedParent = resolveAlbumFolder(State.albumHandle);
   let curatedDirName = null;
   for await (const entry of curatedParent.values()) {
     if (entry.kind === "directory" && entry.name.endsWith(ALBUM_SUFFIX)) { curatedDirName = entry.name; break; }
@@ -2680,12 +2647,27 @@ async function ensureOriginalsHandle() {
   return State.originalsHandle;
 }
 
+// «Папка альбомов» (State.rootHandle) может содержать несколько альбомов как прямых
+// подпапок, каждый — произвольной глубины внутри себя (Camera 1/Camera 2/…). Альбом для
+// данного handle'а — тот прямой потомок rootHandle, что является им самим или его предком;
+// именно на его уровне должны жить "-Albom" и ничего глубже. Идём вверх по State.folderParents
+// (a не вниз от rootHandle) — так не нужен отдельный обход дерева.
+function resolveAlbumFolder(handle) {
+  if (!handle || !State.rootHandle || handle === State.rootHandle) return State.rootHandle;
+  let current = handle;
+  let parent = State.folderParents.get(current);
+  while (parent && parent !== State.rootHandle) {
+    current = parent;
+    parent = State.folderParents.get(current);
+  }
+  return parent ? current : State.rootHandle;
+}
+
 async function ensureCuratedHandle() {
   if (!State.curatedHandle) {
-    // родитель — закреплённая опорная папка (если есть), иначе как раньше — текущая открытая
-    // (см. State.albumAnchorHandle); если такая папка уже найдена при сканировании (пусть и под
-    // старым именем после переименования родителя) — используем её, иначе создаём новую
-    const parent = State.albumAnchorHandle || State.albumHandle;
+    // если такая папка уже найдена при сканировании (пусть и под старым именем после
+    // переименования альбома) — используем её, иначе создаём новую на уровне альбома
+    const parent = resolveAlbumFolder(State.albumHandle);
     const folderName = State.curatedDirName || parent.name + ALBUM_SUFFIX;
     State.curatedHandle = await parent.getDirectoryHandle(folderName, { create: true });
     State.curatedDirName = folderName;
@@ -2695,33 +2677,10 @@ async function ensureCuratedHandle() {
 
 async function ensureDeletedHandle() {
   if (!State.deletedHandle) {
-    const parent = State.albumAnchorHandle || State.rootHandle;
-    State.deletedHandle = await parent.getDirectoryHandle(DELETED_DIR, { create: true });
+    // одна общая корзина на всю «Папку альбомов», а не на каждый альбом отдельно
+    State.deletedHandle = await State.rootHandle.getDirectoryHandle(DELETED_DIR, { create: true });
   }
   return State.deletedHandle;
-}
-
-// закрепляет explicit опорную папку — общий родитель для "-Albom" и "Deleted" (см. State.albumAnchorHandle)
-async function setAlbumAnchor(handle) {
-  State.albumAnchorHandle = handle;
-  try { await idbSet("albumAnchorPath", folderNamePath(handle)); } catch (_) {}
-  State.curatedHandle = null;
-  State.curatedDirName = null;
-  State.deletedHandle = null;
-  await scanFiles();
-  if (State.queue.length > 0) buildGrid();
-  refreshAnchorUi();
-}
-
-async function clearAlbumAnchor() {
-  State.albumAnchorHandle = null;
-  try { await idbSet("albumAnchorPath", null); } catch (_) {}
-  State.curatedHandle = null;
-  State.curatedDirName = null;
-  State.deletedHandle = null;
-  await scanFiles();
-  if (State.queue.length > 0) buildGrid();
-  refreshAnchorUi();
 }
 
 // перемещает текущее фото из рабочей папки в общую корзину DELETED_DIR в корне альбома
@@ -3524,25 +3483,18 @@ function toggleColorPicker() {
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function round1(v) { return Math.round(v * 10) / 10; }
 
-function openAboutModal() {
+async function openAboutModal() {
   el("about-modal").hidden = false;
   const input = el("root-path-input");
   input.disabled = !State.rootHandle;
+  // раньше значение бралось из State.rootAbsolutePath без загрузки из IndexedDB — оно
+  // подгружалось лениво только через ensureRootAbsolutePath/openFolderInExplorer, поэтому
+  // поле в настройках выглядело пустым (как будто сброшенным) до первого клика "Открыть в
+  // Проводнике" в новой сессии, хотя сохранённое значение никуда не пропадало
+  await loadSavedRootAbsolutePath();
   input.value = State.rootAbsolutePath || "";
-  refreshAnchorUi();
 }
 function closeAboutModal() { el("about-modal").hidden = true; }
-
-// отражает State.albumAnchorHandle в окне настроек — путь (если закреплён) и доступность кнопок
-function refreshAnchorUi() {
-  const input = el("anchor-path-input");
-  if (!input) return;
-  input.value = State.albumAnchorHandle
-    ? (folderNamePath(State.albumAnchorHandle).join(" / ") || State.rootHandle.name)
-    : "";
-  el("anchor-set-btn").disabled = !State.albumHandle;
-  el("anchor-clear-btn").disabled = !State.albumAnchorHandle;
-}
 
 // режим просмотра готовых альбомов: дерево слева временно заменяется плоским списком
 // папок "…-Albom" (найденных findAlbumFolders на любой глубине). Строки — те же
@@ -3731,8 +3683,6 @@ function init() {
   });
 
   el("albums-list-btn").addEventListener("click", toggleAlbumsView);
-  el("anchor-set-btn").addEventListener("click", () => setAlbumAnchor(State.albumHandle));
-  el("anchor-clear-btn").addEventListener("click", clearAlbumAnchor);
   el("root-path-input").addEventListener("blur", saveRootAbsolutePathFromInput);
   el("root-path-input").addEventListener("keydown", (evt) => {
     if (evt.key === "Enter") { evt.preventDefault(); el("root-path-input").blur(); }
