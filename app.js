@@ -3540,7 +3540,11 @@ async function toggleAlbumsView() {
     State.albumsViewActive = true;
     el("albums-list-btn").classList.add("active");
     // глобус показывает геоточки только текущего альбома, а не всех сразу — в списке
-    // готовых альбомов "текущего альбома" в этом смысле нет, поэтому кнопку блокируем
+    // готовых альбомов "текущего альбома" в этом смысле нет, поэтому кнопку блокируем;
+    // если окно глобуса уже было открыто для прежнего альбома — закрываем его тоже,
+    // иначе кнопка остаётся подсвеченной активной (disabled это не убирает)
+    if (State.globeWindow && !State.globeWindow.closed) State.globeWindow.close();
+    onGlobeWindowClosed();
     el("globe-btn").disabled = true;
     await renderAlbumsView();
     return;
