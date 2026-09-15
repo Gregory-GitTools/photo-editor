@@ -15,14 +15,15 @@
     border: 2px solid #fff; transform: rotate(-45deg); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
   }
   .geo-pin-name {
-    margin-top: 2px; font: 600 11px/1 system-ui, sans-serif; color: #fff; white-space: nowrap;
-    background: rgba(27, 27, 31, 0.75); border-radius: 3px; padding: 1px 5px;
+    margin-top: 2px; font: 600 14px/1 system-ui, sans-serif; color: #fff; white-space: nowrap;
+    background: rgba(27, 27, 31, 0.75); border-radius: 4px; padding: 2px 7px;
   }
 </style>
 </head>
 <body>
 <div id="globeViz"></div>
 <script src="https://unpkg.com/globe.gl"></script>
+<script src="https://unpkg.com/topojson-client@3"></script>
 <script>
   let albums = []; // [{index, name, lat, lon}, ...] — по одному на готовый альбом
   let lastAlbumsSignature = null; // общий обзор пересчитываем только когда меняется сам набор альбомов
@@ -34,6 +35,11 @@
     .globeImageUrl("textures/earth-daymap-8k.jpg")
     .bumpImageUrl("https://unpkg.com/three-globe/example/img/earth-topology.png")
     .backgroundImageUrl("https://unpkg.com/three-globe/example/img/night-sky.png")
+    .pathPointLat((p) => p[1])
+    .pathPointLng((p) => p[0])
+    .pathColor(() => "rgba(255, 255, 255, 0.45)")
+    .pathStroke(0.3)
+    .pathTransitionDuration(0)
     .htmlElementsData([])
     .htmlLat("lat")
     .htmlLng("lon")
@@ -61,6 +67,26 @@
   }, 100);
 
   globe.controls().autoRotate = false;
+
+  // границы стран — стандартный публичный TopoJSON-датасет (world-atlas), конвертируем
+  // в линии через topojson.mesh с фильтром a!==b: рисуем только рёбра между разными
+  // странами (и внешний контур), общее ребро соседних стран не задваивается
+  fetch("https://unpkg.com/world-atlas@2/countries-110m.json")
+    .then((r) => r.json())
+    .then((topology) => {
+      const mesh = window.topojson.mesh(topology, topology.objects.countries, (a, b) => a !== b);
+      globe.pathsData(mesh.coordinates);
+    })
+    .catch((err) => console.error("Не удалось загрузить границы стран:", err));
+
+  // Ctrl+колесо (в т.ч. синтетическое из pinch-to-zoom на трекпаде) и Ctrl+=/-/0 иначе
+  // одновременно с зумом камеры глобуса ещё и зумят саму страницу в Chrome — от этого
+  // масштаб глобуса и масштаб окна начинают путаться друг с другом. Гасим только браузерный
+  // зум (preventDefault не мешает тому же событию доехать до OrbitControls глобуса)
+  window.addEventListener("wheel", (e) => { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
+  window.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && ["+", "-", "=", "0"].includes(e.key)) e.preventDefault();
+  });
 
   const globeVizEl = document.getElementById("globeViz");
   function resizeGlobe() {

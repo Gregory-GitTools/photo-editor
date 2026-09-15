@@ -219,7 +219,7 @@ async function openAlbum(handle) {
 
   if (!State.rootHandle) {
     State.rootHandle = handle;
-    State.treeBuildPromise = buildFolderTree(handle).catch((e) => console.error("Ошибка построения дерева папок", e));
+    State.treeBuildPromise = buildFolderTree(handle, { silent: true }).catch((e) => console.error("Ошибка построения дерева папок", e));
     el("albums-list-btn").disabled = false;
     // запоминаем корень дерева — при следующем запуске дерево слева строится от этой же папки
     try {
@@ -715,8 +715,12 @@ async function expandTreeToPath(namesPath) {
   return current;
 }
 
-async function buildFolderTree(rootHandle) {
-  el("folder-tree").innerHTML = "<p class=\"albums-list-empty\">Поиск…</p>";
+async function buildFolderTree(rootHandle, opts = {}) {
+  // silent: приложение всегда стартует в режиме Альбомы, поэтому первое построение дерева
+  // (из openAlbum, для карт handle'ов на будущее) никогда не должно быть видно пользователю —
+  // иначе перед автопереключением в Альбомы мелькает полный проводник (тот самый баг)
+  const silent = !!opts.silent;
+  if (!silent) el("folder-tree").innerHTML = "<p class=\"albums-list-empty\">Поиск…</p>";
   pushBusyCursor(); // построение дерева пересканирует диск (см. loadChildren) — в большой папке это заметно по времени
   try {
     const generation = ++State.treeGeneration;
@@ -728,9 +732,10 @@ async function buildFolderTree(rootHandle) {
     list.className = "folder-tree-list";
     const rootLi = await createFolderNode(rootHandle, { expanded: true });
     if (generation !== State.treeGeneration) return; // альбом открыли повторно, пока строилось это дерево — устаревший результат не подменяет уже актуальное дерево
+    list.appendChild(rootLi);
+    if (silent) return;
     const container = el("folder-tree");
     container.innerHTML = "";
-    list.appendChild(rootLi);
     container.appendChild(list);
     highlightFolderRow(rootLi.querySelector(".folder-node-row"));
   } finally {
@@ -2860,13 +2865,22 @@ async function saveCurrent() {
       const fullQuad = State.perspectiveQuad.map((pt) => ({ x: pt.x * scale, y: pt.y * scale }));
       sourceCanvas = warpRectToQuad(fullCanvas, fullQuad, fullCanvas.width, fullCanvas.height);
     }
-    clampCropRectToCanvas(State.cropRect, State.previewW, State.previewH);
-    const fullRect = {
-      x: State.cropRect.x * scale,
-      y: State.cropRect.y * scale,
-      w: State.cropRect.w * scale,
-      h: State.cropRect.h * scale,
-    };
+    // рамка обрезки скрыта (State.cropVisible === false) — значит пользователь кроп не
+    // использует, и сохранять нужно фото целиком (после поворота/перспективы, но без
+    // навязанного пресетного кадра), а не то, что осталось в State.cropRect от предыдущего
+    // показа рамки (например, ещё до её выключения)
+    let fullRect;
+    if (State.cropVisible) {
+      clampCropRectToCanvas(State.cropRect, State.previewW, State.previewH);
+      fullRect = {
+        x: State.cropRect.x * scale,
+        y: State.cropRect.y * scale,
+        w: State.cropRect.w * scale,
+        h: State.cropRect.h * scale,
+      };
+    } else {
+      fullRect = { x: 0, y: 0, w: sourceCanvas.width, h: sourceCanvas.height };
+    }
     const outCanvas = exportCrop(sourceCanvas, fullRect, colorOpts);
     const rawBlob = await new Promise((resolve) => outCanvas.toBlob(resolve, "image/jpeg", 0.92));
     // canvas.toBlob() стирает весь EXIF — возвращаем камеру/дату/GPS исходного фото
