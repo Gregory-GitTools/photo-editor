@@ -89,6 +89,9 @@ const State = {
   copyMode: false, // режим редактирования параметров: кнопки копирования + редактируемые поля
   updateGpsRow: null, // колбэк, которым клик по карте обновляет отображение строки GPS
   albumGeo: [], // [{lat,lon}|null, ...] — координаты всех фото альбома, параллельно State.queue
+  albumsList: [], // снимок [{handle,name,path}] из findAlbumFolders — актуален, пока активен режим "Альбомы"
+  albumsGeo: [], // [{lat,lon}|null, ...] параллельно albumsList — по одной метке на альбом, для глобуса всех альбомов
+  albumsGeoGeneration: 0, // счётчик — фоновое сканирование геоданных прошлого списка альбомов не должно писать поверх нового
   rootAbsolutePath: null, // путь на диске к State.rootHandle — только для кнопки "открыть в Проводнике"
   musicFiles: [], // аудиофайлы из папки "Music" в корне дерева — фон для слайдшоу, необязательны
   musicRootHandle: null, // rootHandle, для которого уже просканирована папка "Music" — чтобы не пересканировать при каждом запуске слайдшоу
@@ -201,6 +204,9 @@ async function pickAlbum() {
     // необязательная удобная фича
   }
   await openAlbum(handle);
+  // приложение всегда открывается в режиме "Альбомы" — это не запоминаемая настройка, а
+  // фиксированный старт (см. project_photo_editor_albom_redesign, пункт 5)
+  if (!State.albumsViewActive) await toggleAlbumsView();
 }
 
 async function openAlbum(handle) {
@@ -477,12 +483,6 @@ async function createFolderNode(handle, opts = {}) {
     highlightFolderRow(row);
     await loadChildren(); // всегда пересканируем — структура могла измениться с прошлого раза (а не только если !loaded)
     await openAlbum(handle);
-    if (State.albumsViewActive) {
-      // строку кликнули внутри плоского списка «-Albom» — считаем это полноценным открытием
-      // альбома и выходом из списка (иначе слева так и останется список альбомов, но глобус
-      // уже включится под открытое фото — рассинхрон режима и кнопки)
-      await toggleAlbumsView();
-    }
     // путь запоминаем только по реальному клику в дереве — так восстановление фокуса
     // (которое само открывает альбомы программно) не перетирает его неполным путём
     try {
@@ -800,6 +800,7 @@ async function tryRestoreLastAlbum() {
     State.rootHandle = null;
     await openAlbum(handle);
     await restoreFocusInTree();
+    if (!State.albumsViewActive) await toggleAlbumsView();
     return;
   }
 
@@ -814,6 +815,7 @@ async function tryRestoreLastAlbum() {
         State.rootHandle = null;
         await openAlbum(handle);
         await restoreFocusInTree();
+        if (!State.albumsViewActive) await toggleAlbumsView();
       } else {
         setStatus("status-bar", "Доступ к папке не разрешён.");
       }
@@ -1667,19 +1669,27 @@ function setCurrentGeo(lat, lon) {
 function setMapButtonsEnabled(enabled) {
   el("properties-map-btn").disabled = !enabled;
   el("properties-map-new-btn").disabled = !enabled;
-  el("globe-btn").disabled = !enabled;
 }
 
-// единая точка обновления обеих карт и глобуса — так все три всегда показывают один и тот
-// же набор меток текущего альбома и одинаково подсвечивают текущее фото
+// кнопка глобуса не привязана к текущему фото — она значит "все готовые альбомы, по одной
+// метке на каждый", поэтому включена ровно тогда, когда активен режим "Альбомы" (см.
+// toggleAlbumsView). Выключение обязано закрыть окно глобуса и забыть список альбомов —
+// иначе при повторном входе в режим окно осталось бы с меток прошлого списка
+function setGlobeButtonEnabled(enabled) {
+  el("globe-btn").disabled = !enabled;
+  if (!enabled) {
+    if (State.globeWindow && !State.globeWindow.closed) State.globeWindow.close();
+    onGlobeWindowClosed();
+    State.albumsList = [];
+    State.albumsGeo = [];
+  }
+}
+
+// единая точка обновления обеих карт — так они всегда показывают один и тот же набор
+// меток текущего альбома и одинаково подсвечивают текущее фото (у глобуса — см. refreshAlbumsGlobe)
 function refreshMaps() {
   if (State.mapWindow && !State.mapWindow.closed) {
     State.mapWindow.postMessage({ points: State.albumGeo, activeIndex: State.index, copyMode: State.copyMode }, "*");
-  }
-  if (State.globeWindow && !State.globeWindow.closed) {
-    // глобус только показывает и позволяет кликом перейти к фото — простановку координат
-    // кликом (copyMode) не поддерживает, поэтому её не шлём
-    State.globeWindow.postMessage({ points: State.albumGeo, activeIndex: State.index }, "*");
   }
   const embedWrap = el("properties-map-embed");
   if (embedWrap && !embedWrap.hidden) refreshEmbeddedMapMarkers();
@@ -1788,6 +1798,54 @@ function onGlobeWindowClosed() {
   globeWindowWatcher = null;
   State.globeWindow = null;
   el("globe-btn").classList.remove("active");
+}
+
+// сканирует геоданные готовых альбомов в фоне для глобуса — по одной точке на альбом (первое
+// найденное фото с GPS в самой папке "-Albom", без вложенных подпапок — она всегда плоская,
+// см. scanFiles), а не по одной на каждое фото, как у collectAlbumGeo
+async function collectAlbumsGeo(generation) {
+  const list = State.albumsList;
+  const imageRe = /\.(jpe?g|png)$/i;
+  const CONCURRENCY = 4;
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      if (State.albumsGeoGeneration !== generation) return;
+      const i = nextIndex++;
+      if (i >= list.length) return;
+      try {
+        for await (const entry of list[i].handle.values()) {
+          if (State.albumsGeoGeneration !== generation) return;
+          if (entry.kind !== "file" || !imageRe.test(entry.name)) continue;
+          const file = await entry.getFile();
+          const exif = readExif(await file.arrayBuffer());
+          if (State.albumsGeoGeneration !== generation) return;
+          if (exif && exif.lat != null && exif.lon != null) {
+            State.albumsGeo[i] = { lat: exif.lat, lon: exif.lon };
+            refreshAlbumsGlobe();
+            break;
+          }
+        }
+      } catch (e) {
+        // пропускаем альбом с нечитаемыми файлами, не прерывая остальные
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, list.length) }, worker));
+}
+
+// шлёт в открытое окно глобуса метки всех готовых альбомов, у которых нашлась точка — по
+// одной на альбом, в отличие от refreshMaps(), который шлёт все фото ТЕКУЩЕГО альбома
+function refreshAlbumsGlobe() {
+  if (!(State.globeWindow && !State.globeWindow.closed)) return;
+  const albums = State.albumsList
+    .map((a, i) => (State.albumsGeo[i]
+      ? { index: i, name: a.name.endsWith(ALBUM_SUFFIX) ? a.name.slice(0, -ALBUM_SUFFIX.length) : a.name, lat: State.albumsGeo[i].lat, lon: State.albumsGeo[i].lon }
+      : null))
+    .filter(Boolean);
+  State.globeWindow.postMessage({ albums }, "*");
 }
 
 function formatFileSize(bytes) {
@@ -3518,6 +3576,7 @@ async function renderAlbumsView() {
     State.folderExpanders = new Map();
     State.folderChildren = new Map();
     const albums = await findAlbumFolders();
+    State.albumsList = albums;
     container.innerHTML = "";
     if (albums.length === 0) {
       container.innerHTML = "<p class=\"albums-list-empty\">Папки «…-Albom» не найдены</p>";
@@ -3539,18 +3598,17 @@ async function toggleAlbumsView() {
   if (!State.albumsViewActive) {
     State.albumsViewActive = true;
     el("albums-list-btn").classList.add("active");
-    // глобус показывает геоточки только текущего альбома, а не всех сразу — в списке
-    // готовых альбомов "текущего альбома" в этом смысле нет, поэтому кнопку блокируем;
-    // если окно глобуса уже было открыто для прежнего альбома — закрываем его тоже,
-    // иначе кнопка остаётся подсвеченной активной (disabled это не убирает)
-    if (State.globeWindow && !State.globeWindow.closed) State.globeWindow.close();
-    onGlobeWindowClosed();
-    el("globe-btn").disabled = true;
     await renderAlbumsView();
+    // глобус теперь всегда значит "все готовые альбомы, по одной метке на каждый" — включаем
+    // его вместе с режимом "Альбомы" и сразу запускаем фоновый поиск геоданных по списку
+    setGlobeButtonEnabled(true);
+    State.albumsGeo = new Array(State.albumsList.length).fill(null);
+    collectAlbumsGeo(++State.albumsGeoGeneration);
     return;
   }
   State.albumsViewActive = false;
   el("albums-list-btn").classList.remove("active");
+  setGlobeButtonEnabled(false);
   // путь берём ДО перестройки дерева (buildFolderTree сбрасывает folderParents) — на этот
   // момент карта ещё та, что построил findAlbumFolders внутри renderAlbumsView, и в ней уже
   // есть цепочка предков и для альбома, открытого кликом по строке списка альбомов
@@ -3560,10 +3618,6 @@ async function toggleAlbumsView() {
   const target = await expandTreeToPath(activePath);
   const row = State.folderRows.get(target);
   if (row) highlightFolderRow(row);
-  // если пользователь не кликал по строке альбома в списке, openAlbum() не вызывался и
-  // State.index остался тем же, что и до входа в список — просто возвращаем кнопку в то
-  // состояние, которое отражает текущее фото (см. setMapButtonsEnabled)
-  el("globe-btn").disabled = State.index < 0;
 }
 
 // путь, который пользователь вручную набрал/поправил в настройках — тот же путь, что раньше
@@ -3745,18 +3799,34 @@ function init() {
   el("properties-map-btn").addEventListener("click", toggleEmbeddedMap);
   el("properties-map-new-btn").addEventListener("click", toggleLocationMapWindow);
   el("globe-btn").addEventListener("click", toggleGlobeWindow);
-  // сообщения из отдельных окон map.html/globe.html: готовность к получению точек альбома,
-  // либо клик по карте/капле/глобусу — переход к фото или геопривязка (только у карты —
-  // глобус координаты кликом не проставляет)
-  window.addEventListener("message", (e) => {
+  // сообщения из отдельных окон map.html/globe.html: готовность к получению точек, клик по
+  // капле карты (переход к фото или геопривязка) или клик по метке глобуса (открыть альбом)
+  window.addEventListener("message", async (e) => {
     if (e.source !== State.mapWindow && e.source !== State.globeWindow) return;
     const data = e.data || {};
-    if (data.type === "map-ready" || data.type === "globe-ready") {
+    if (data.type === "map-ready") {
       refreshMaps();
+      return;
+    }
+    if (data.type === "globe-ready") {
+      refreshAlbumsGlobe();
       return;
     }
     if (typeof data.focusIndex === "number") {
       goToPhoto(data.focusIndex);
+      return;
+    }
+    if (typeof data.openAlbumIndex === "number") {
+      const entry = State.albumsList[data.openAlbumIndex];
+      if (!entry) return;
+      const row = State.folderRows.get(entry.handle);
+      if (row) highlightFolderRow(row);
+      await openAlbum(entry.handle);
+      try {
+        await idbSet("lastFocusedPath", folderNamePath(entry.handle));
+      } catch (_) {
+        // необязательная удобная фича
+      }
       return;
     }
     if (e.source === State.mapWindow && typeof data.lat === "number" && typeof data.lon === "number") {
