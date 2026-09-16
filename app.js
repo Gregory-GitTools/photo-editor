@@ -212,6 +212,7 @@ async function pickAlbum() {
 async function openAlbum(handle) {
   const generation = ++State.albumGeneration; // помечаем это открытие — если пока грузимся, откроют ещё один альбом, наш фон должен это заметить и остановиться
   State.albumHandle = handle;
+  refreshAlbumsGlobe(); // если окно глобуса открыто — подсветить каплю только что открытого альбома
   State.originalsHandle = null;
   State.curatedHandle = null;
   State.curatedDirName = null; // реальное имя папки "-Albom" на диске — узнаём при сканировании
@@ -354,7 +355,14 @@ async function findAlbumFolders() {
     }
   }
   await walk(State.rootHandle, []);
-  found.sort((a, b) => a.name.localeCompare(b.name));
+  // порядок подчиняется тому же State.folderSortMode, что и обычное дерево папок (folder-sort-select)
+  const mode = State.folderSortMode;
+  if (mode === "date-desc" || mode === "date-asc") {
+    const keyed = await Promise.all(found.map(async (a) => ({ a, t: await folderNewestFileTime(a.handle) })));
+    keyed.sort((x, y) => (x.t !== y.t ? (mode === "date-desc" ? y.t - x.t : x.t - y.t) : x.a.name.localeCompare(y.a.name)));
+    return keyed.map((k) => k.a);
+  }
+  found.sort((a, b) => (mode === "name-desc" ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name)));
   return found;
 }
 
@@ -861,10 +869,13 @@ async function restoreFocusInTree() {
 async function scanFiles() {
   setStatus("status-bar", "Сканирую альбом...");
   const imageRe = /\.(jpe?g|png)$/i;
-  const files = [];
+  let files = [];
   for await (const entry of State.albumHandle.values()) {
     if (entry.kind === "file" && imageRe.test(entry.name)) files.push(entry);
   }
+  // порядок фото внутри альбома — всегда по имени, независимо от State.folderSortMode: тот
+  // выбор влияет только на порядок папок в левой панели (дерево и список альбомов), листать
+  // сами фото в другом порядке не нужно (обсуждали и вернули как было)
   files.sort((a, b) => a.name.localeCompare(b.name));
 
   // папку "-Albom" ищем не в открытой сейчас подпапке, а в папке альбома — прямом потомке
@@ -1156,6 +1167,7 @@ function askUnsavedChanges(name) {
       discardBtn.removeEventListener("click", onDiscard);
       cancelBtn.removeEventListener("click", onCancel);
       modal.removeEventListener("click", onBackdrop);
+      modal.removeEventListener("keydown", onKeydown);
       resolve(result);
     };
     const onSave = () => cleanup("save");
@@ -1165,12 +1177,21 @@ function askUnsavedChanges(name) {
     const onBackdrop = (evt) => {
       if (evt.target.id === "unsaved-modal") cleanup("cancel");
     };
+    // фокус на "Сохранить" виден пользователю (обводка primary-кнопки), но обычный <button> сам
+    // по себе фокус при открытии модалки не получает — без явного focus() Enter не долетал
+    // до кнопки и срабатывал только клик мышью
+    const onKeydown = (evt) => {
+      if (evt.key === "Enter") { evt.preventDefault(); onSave(); }
+      else if (evt.key === "Escape") { evt.preventDefault(); onCancel(); }
+    };
 
     saveBtn.addEventListener("click", onSave);
     discardBtn.addEventListener("click", onDiscard);
     cancelBtn.addEventListener("click", onCancel);
     modal.addEventListener("click", onBackdrop);
+    modal.addEventListener("keydown", onKeydown);
     modal.hidden = false;
+    saveBtn.focus();
   });
 }
 
@@ -1850,7 +1871,10 @@ function refreshAlbumsGlobe() {
       ? { index: i, name: a.name.endsWith(ALBUM_SUFFIX) ? a.name.slice(0, -ALBUM_SUFFIX.length) : a.name, lat: State.albumsGeo[i].lat, lon: State.albumsGeo[i].lon }
       : null))
     .filter(Boolean);
-  State.globeWindow.postMessage({ albums }, "*");
+  // index у элементов albums — это исходный индекс в State.albumsList (не смещается фильтром
+  // .filter(Boolean) выше), поэтому глобус может сравнивать его с activeIndex напрямую
+  const activeIndex = State.albumsList.findIndex((a) => a.handle === State.albumHandle);
+  State.globeWindow.postMessage({ albums, activeIndex }, "*");
 }
 
 function formatFileSize(bytes) {
@@ -2738,8 +2762,16 @@ async function ensureCuratedHandle() {
     // переименования альбома) — используем её, иначе создаём новую на уровне альбома
     const parent = resolveAlbumFolder(State.albumHandle);
     const folderName = State.curatedDirName || parent.name + ALBUM_SUFFIX;
+    const isNewFolder = !State.curatedDirName;
     State.curatedHandle = await parent.getDirectoryHandle(folderName, { create: true });
     State.curatedDirName = folderName;
+    // если "-Albom" создаётся впервые, у родительской папки трипа появляется первый дочерний
+    // узел — но стрелку раскрытия дерева слева посчитали один раз при построении узла и без
+    // явного обновления она так и останется пустой (см. createFolderNode/initialSubdirs)
+    if (isNewFolder) {
+      const refresh = State.folderExpanders.get(parent);
+      if (refresh) await refresh();
+    }
   }
   return State.curatedHandle;
 }
@@ -3274,11 +3306,20 @@ function updateColumnMode(grid) {
 // есть несохранённые правки); не перехватываем стрелки, когда они нужны для чего-то другого —
 // ползунок угла, выпадающий список формата, поля ввода, модалки, палитра
 function onViewerKeydown(evt) {
-  if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(evt.key)) return;
+  if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Delete"].includes(evt.key)) return;
   if (!State.fullBitmap) return;
   if (!el("unsaved-modal").hidden || !el("about-modal").hidden) return;
   const tag = document.activeElement && document.activeElement.tagName;
   if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+
+  // Delete отправляет текущее фото в корзину сразу, без подтверждения — по просьбе Григория
+  // это должно ускорять отбор кадров, а не тормозить его лишним диалогом
+  if (evt.key === "Delete") {
+    if (State.colorPickerActive) return;
+    evt.preventDefault();
+    deleteCurrentPhoto();
+    return;
+  }
 
   // в подборе цвета лента показывает не фото альбома, а варианты текущего кадра — тем же
   // порядком стрелок листаем их, а не State.queue
@@ -3743,9 +3784,14 @@ function init() {
     localStorage.setItem(FOLDER_SORT_STORAGE_KEY, State.folderSortMode);
     evt.target.blur(); // без этого выбранный option оставляет вокруг select синее кольцо фокуса, будто кнопка залипла
     if (State.albumsViewActive) {
-      // список альбомов всегда по алфавиту — порядок папок его не касается, поэтому смена
-      // сортировки просто возвращает обычное дерево (уже в новом порядке)
-      await toggleAlbumsView();
+      // Раньше здесь ошибочно вызывался toggleAlbumsView() — это тумблер, и вызов посреди
+      // активного режима Альбомы попросту выключал его. Сортировка касается только списка
+      // папок ("Проводник"): плоского списка альбомов (findAlbumFolders учитывает
+      // State.folderSortMode) — его просто перерисовываем; порядок фото внутри уже открытого
+      // альбома сортировкой не затрагивается (scanFiles всегда по имени), поэтому там делать нечего
+      if (State.index < 0) {
+        await renderAlbumsView();
+      }
       return;
     }
     if (State.rootHandle) {

@@ -7,16 +7,28 @@
 <style>
   html, body, #globeViz { margin: 0; height: 100%; background: #000; overflow: hidden; }
 
-  /* та же капля, что и на плоской карте (map.html/style.css), но подпись — имя альбома,
-     а не число кадров: на глобусе одна метка = один готовый альбом, а не одно фото */
-  .geo-pin-wrap { display: flex; flex-direction: column; align-items: center; pointer-events: auto; cursor: pointer; }
+  /* капля — единственная кликабельная часть метки (см. .geo-pin ниже); сама обёртка
+     pointer-events:none пропускает колесо/перетаскивание глобуса мимо себя, иначе рядом с
+     любой меткой зум колесом переставал работать, ожидая клика по всей её площади */
+  .geo-pin-wrap { position: relative; pointer-events: none; }
   .geo-pin {
-    width: 22px; height: 22px; border-radius: 50% 50% 50% 0; background: #4a90d9;
-    border: 2px solid #fff; transform: rotate(-45deg); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+    position: relative; width: 18px; height: 18px; border-radius: 50%; background: #4a90d9;
+    border: 2px solid #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+    pointer-events: auto; cursor: pointer;
   }
+  /* капля открытого сейчас альбома — см. activeIndex в render() */
+  .geo-pin-wrap.active .geo-pin {
+    background: #ffb020;
+    box-shadow: 0 0 0 5px rgba(255, 176, 32, 0.4), 0 1px 3px rgba(0, 0, 0, 0.5);
+  }
+  /* подпись-«флажок»: развёрнута от капли под углом, как на макете — не отдельная плашка
+     сверху, а лента, растущая по диагонали, что издали читается как кнопка. Без фоновой
+     плашки — читаемость на светлых/тёмных участках земли даёт text-shadow вместо неё */
   .geo-pin-name {
-    margin-top: 2px; font: 600 14px/1 system-ui, sans-serif; color: #fff; white-space: nowrap;
-    background: rgba(27, 27, 31, 0.75); border-radius: 4px; padding: 2px 7px;
+    position: absolute; left: 13px; bottom: 8px; transform-origin: left bottom;
+    transform: rotate(-40deg); text-align: left; pointer-events: none;
+    font: 600 14px/1 system-ui, sans-serif; color: #fff; white-space: nowrap;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 4px rgba(0, 0, 0, 0.9);
   }
 </style>
 </head>
@@ -26,6 +38,7 @@
 <script src="https://unpkg.com/topojson-client@3"></script>
 <script>
   let albums = []; // [{index, name, lat, lon}, ...] — по одному на готовый альбом
+  let activeIndex = -1; // index (см. albums) альбома, открытого сейчас в главном окне — его каплю подсвечиваем
   let lastAlbumsSignature = null; // общий обзор пересчитываем только когда меняется сам набор альбомов
 
   // Инициализация — один в один с travel-globe/app.js: локальная 8k-текстура Земли вместо
@@ -46,8 +59,11 @@
     .htmlElement((a) => {
       const wrap = document.createElement("div");
       wrap.className = "geo-pin-wrap";
+      wrap.dataset.index = a.index;
       wrap.innerHTML = `<div class="geo-pin"></div><div class="geo-pin-name">${a.name}</div>`;
-      wrap.onclick = (e) => {
+      // клик открывает альбом только по самой капле (не по всей обёртке с подписью) — см.
+      // pointer-events на .geo-pin-wrap выше
+      wrap.querySelector(".geo-pin").onclick = (e) => {
         e.stopPropagation();
         if (window.opener && !window.opener.closed) {
           window.opener.postMessage({ openAlbumIndex: a.index }, "*");
@@ -57,6 +73,10 @@
     });
 
   globe.renderer().setPixelRatio(window.devicePixelRatio);
+  // сама Земля на фоне чёрного космоса выходит слишком тёмной и плохо отличима от фона —
+  // штатного освещения three-globe (globe.lights()) на такой сцене маловато, поднимаем яркость
+  globe.renderer().toneMappingExposure = 1.4;
+  globe.lights().forEach((light) => { light.intensity *= 1.6; });
   const sharpenGlobeTextureInterval = setInterval(() => {
     const globeTexture = globe.globeMaterial().map;
     if (globeTexture) {
@@ -100,9 +120,23 @@
     return list.map((a) => `${a.index}:${a.lat.toFixed(6)},${a.lon.toFixed(6)}`).join(";");
   }
 
-  // рендер — нет понятия "текущее фото"/фокуса, камера всегда смотрит на центроид всех меток
+  // рендер — нет понятия "текущее фото"/фокуса, камера всегда смотрит на центроид всех меток.
+  // Подсветку активного альбома делаем отдельным проходом по DOM (а не через htmlElement()),
+  // потому что globe.gl не перевызывает фабрику элемента при обновлении уже существующих меток
+  function applyActivePin() {
+    document.querySelectorAll(".geo-pin-wrap").forEach((wrap) => {
+      wrap.classList.toggle("active", Number(wrap.dataset.index) === activeIndex);
+    });
+  }
+
+  // DOM-узлы меток three-globe вставляет не синхронно с вызовом htmlElementsData() (а на одном
+  // из следующих кадров рендера) — обычный вызов applyActivePin() сразу после него их ещё не
+  // застаёт, поэтому дополнительно ловим появление меток наблюдателем за DOM
+  new MutationObserver(applyActivePin).observe(document.getElementById("globeViz"), { childList: true, subtree: true });
+
   function render() {
     globe.htmlElementsData(albums);
+    applyActivePin();
     const sig = albumsSignature(albums);
     if (sig !== lastAlbumsSignature) {
       lastAlbumsSignature = sig;
@@ -120,6 +154,7 @@
     const data = e.data || {};
     if (!Array.isArray(data.albums)) return;
     albums = data.albums;
+    activeIndex = typeof data.activeIndex === "number" ? data.activeIndex : -1;
     render();
   });
 
