@@ -16,19 +16,30 @@
     border: 2px solid #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
     pointer-events: auto; cursor: pointer;
   }
-  /* капля открытого сейчас альбома — см. activeIndex в render() */
+  /* капля открытого сейчас альбома — см. activeIndex в render(). Подъём над соседними метками
+     (чтобы не терялась среди наложенных капель/подписей) через z-index в JS, не в CSS — см.
+     applyActivePin() в скрипте ниже: three.js CSS2DRenderer сам управляет inline style.zIndex
+     каждой метки, обычное css-правило тут бесполезно */
   .geo-pin-wrap.active .geo-pin {
     background: #ffb020;
     box-shadow: 0 0 0 5px rgba(255, 176, 32, 0.4), 0 1px 3px rgba(0, 0, 0, 0.5);
   }
   /* подпись-«флажок»: развёрнута от капли под углом, как на макете — не отдельная плашка
      сверху, а лента, растущая по диагонали, что издали читается как кнопка. Без фоновой
-     плашки — читаемость на светлых/тёмных участках земли даёт text-shadow вместо неё */
+     плашки — читаемость на светлых/тёмных участках земли даёт text-shadow вместо неё.
+     Когда альбомов рядом много, их подписи наползают друг на друга и превращаются в кашу —
+     поэтому по умолчанию подпись скрыта и появляется только у активного альбома или при
+     наведении на саму каплю (.geo-pin, единственная часть с pointer-events: auto) */
   .geo-pin-name {
     position: absolute; left: 13px; bottom: 8px; transform-origin: left bottom;
     transform: rotate(-40deg); text-align: left; pointer-events: none;
     font: 600 14px/1 system-ui, sans-serif; color: #fff; white-space: nowrap;
     text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 4px rgba(0, 0, 0, 0.9);
+    opacity: 0; transition: opacity 120ms ease;
+  }
+  .geo-pin-wrap.active .geo-pin-name,
+  .geo-pin:hover + .geo-pin-name {
+    opacity: 1;
   }
 </style>
 </head>
@@ -122,17 +133,29 @@
 
   // рендер — нет понятия "текущее фото"/фокуса, камера всегда смотрит на центроид всех меток.
   // Подсветку активного альбома делаем отдельным проходом по DOM (а не через htmlElement()),
-  // потому что globe.gl не перевызывает фабрику элемента при обновлении уже существующих меток
+  // потому что globe.gl не перевызывает фабрику элемента при обновлении уже существующих меток.
+  // z-index через CSS тут не работает: three.js CSS2DRenderer сам перезаписывает inline
+  // style.zIndex у каждой метки на КАЖДОМ кадре, ранжируя капли по расстоянию до камеры (эффект
+  // глубины) — любое наше css-правило .active{z-index} эта перезапись тут же затирает.
+  // Поэтому после её же перезаписи выставляем активной капле zIndex с большим запасом
+  // (см. MutationObserver ниже, который ловит именно эти перезаписи style)
+  const ACTIVE_PIN_Z_INDEX = "999999";
   function applyActivePin() {
     document.querySelectorAll(".geo-pin-wrap").forEach((wrap) => {
-      wrap.classList.toggle("active", Number(wrap.dataset.index) === activeIndex);
+      const isActive = Number(wrap.dataset.index) === activeIndex;
+      wrap.classList.toggle("active", isActive);
+      if (isActive && wrap.style.zIndex !== ACTIVE_PIN_Z_INDEX) wrap.style.zIndex = ACTIVE_PIN_Z_INDEX;
     });
   }
 
   // DOM-узлы меток three-globe вставляет не синхронно с вызовом htmlElementsData() (а на одном
   // из следующих кадров рендера) — обычный вызов applyActivePin() сразу после него их ещё не
-  // застаёт, поэтому дополнительно ловим появление меток наблюдателем за DOM
-  new MutationObserver(applyActivePin).observe(document.getElementById("globeViz"), { childList: true, subtree: true });
+  // застаёт, поэтому дополнительно ловим появление меток наблюдателем за DOM. attributes/style —
+  // именно та самая перезапись zIndex по глубине на каждом кадре (см. комментарий у
+  // applyActivePin): ловим её и тут же возвращаем активной капле её большой zIndex обратно
+  new MutationObserver(applyActivePin).observe(document.getElementById("globeViz"), {
+    childList: true, subtree: true, attributes: true, attributeFilter: ["style"],
+  });
 
   function render() {
     globe.htmlElementsData(albums);
