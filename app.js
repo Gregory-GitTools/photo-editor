@@ -1302,7 +1302,7 @@ function refreshDisplayBitmap() {
   c.height = h;
   const cctx = c.getContext("2d");
   cctx.drawImage(State.previewBitmap, 0, 0);
-  if (State.colorVariant.key !== COLOR_VARIANTS[1].key) {
+  if (State.colorVariant.key !== COLOR_VARIANTS[0].key) {
     const imgData = cctx.getImageData(0, 0, w, h);
     applyColorTreatment(imgData, {
       saturationBoost: State.colorVariant.saturationBoost,

@@ -52,20 +52,25 @@ function drawRotatedAt(ctx, bitmap, angleDeg, offsetX, offsetY) {
 }
 
 // Кроп из исходного canvas + автоулучшение (перцентильный автоконтраст по каналам + лёгкая насыщенность).
+// Автоконтраст считается по гистограмме ВСЕГО кадра, а не только вырезанного прямоугольника —
+// иначе более тугой кроп меняет то, что попадает в гистограмму (например, обрезает яркое небо
+// или тёмный край), и автоуровни каждый раз перестраиваются по-разному, из-за чего одно и то
+// же фото после обрезки выглядит темнее/контрастнее, чем в превью до неё (см. refreshDisplayBitmap,
+// который тоже считает по всему кадру).
 function exportCrop(sourceCanvas, rect, { saturationBoost = 1.15, clipPercent = 0.005, warm = 0 } = {}) {
+  const sctx = sourceCanvas.getContext("2d");
+  const fullData = sctx.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+  applyColorTreatment(fullData, { saturationBoost, clipPercent, warm });
+  sctx.putImageData(fullData, 0, 0);
+
   const out = document.createElement("canvas");
   out.width = Math.round(rect.w);
   out.height = Math.round(rect.h);
-  const octx = out.getContext("2d");
-  octx.drawImage(
+  out.getContext("2d").drawImage(
     sourceCanvas,
     rect.x, rect.y, rect.w, rect.h,
     0, 0, out.width, out.height
   );
-
-  const imgData = octx.getImageData(0, 0, out.width, out.height);
-  applyColorTreatment(imgData, { saturationBoost, clipPercent, warm });
-  octx.putImageData(imgData, 0, 0);
 
   return out;
 }
