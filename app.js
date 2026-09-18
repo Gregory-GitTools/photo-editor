@@ -85,6 +85,7 @@ const State = {
   currentExif: null, // разобранный EXIF текущего фото — чтобы вернуть камеру/GPS в файл при сохранении
   mapWindow: null, // ссылка на открытое окно карты, чтобы обновлять его при смене фото
   globeWindow: null, // ссылка на открытое окно глобуса (globe.html), см. mapWindow
+  globeAlbumMode: false, // globeWindow сейчас показывает карту фото альбома (нырнули жестом зума), а не сам глобус — см. refreshMaps()
   previewZoom: 1, // масштаб превью в canvas-wrap, меняется колесом мыши
   copyMode: false, // режим редактирования параметров: кнопки копирования + редактируемые поля
   updateGpsRow: null, // колбэк, которым клик по карте обновляет отображение строки GPS
@@ -1714,8 +1715,15 @@ function setGlobeButtonEnabled(enabled) {
 // единая точка обновления обеих карт — так они всегда показывают один и тот же набор
 // меток текущего альбома и одинаково подсвечивают текущее фото (у глобуса — см. refreshAlbumsGlobe)
 function refreshMaps() {
+  const payload = { points: State.albumGeo, activeIndex: State.index, copyMode: State.copyMode };
   if (State.mapWindow && !State.mapWindow.closed) {
-    State.mapWindow.postMessage({ points: State.albumGeo, activeIndex: State.index, copyMode: State.copyMode }, "*");
+    State.mapWindow.postMessage(payload, "*");
+  }
+  // глобус получает те же точки, только пока внутри него открыт режим альбома (см.
+  // "globe-entered-album" в обработчике message ниже) — иначе на "глобус всех альбомов" впустую
+  // капал бы трафик о фото того альбома, что открыт в фоне
+  if (State.globeWindow && !State.globeWindow.closed && State.globeAlbumMode) {
+    State.globeWindow.postMessage(payload, "*");
   }
   const embedWrap = el("properties-map-embed");
   if (embedWrap && !embedWrap.hidden) refreshEmbeddedMapMarkers();
@@ -1823,6 +1831,7 @@ function onGlobeWindowClosed() {
   clearInterval(globeWindowWatcher);
   globeWindowWatcher = null;
   State.globeWindow = null;
+  State.globeAlbumMode = false;
   el("globe-btn").classList.remove("active");
 }
 
@@ -3788,9 +3797,15 @@ function init() {
       // активного режима Альбомы попросту выключал его. Сортировка касается только списка
       // папок ("Проводник"): плоского списка альбомов (findAlbumFolders учитывает
       // State.folderSortMode) — его просто перерисовываем; порядок фото внутри уже открытого
-      // альбома сортировкой не затрагивается (scanFiles всегда по имени), поэтому там делать нечего
-      if (State.index < 0) {
-        await renderAlbumsView();
+      // альбома сортировкой не затрагивается (scanFiles всегда по имени), поэтому там делать нечего.
+      // Перерисовываем всегда, а не только при State.index < 0 — открытие альбома кликом по
+      // строке списка не выключает albumsViewActive (см. клик по name в createFolderNode), так
+      // что список остаётся на экране и при открытом альбоме; старая проверка из-за этого молча
+      // игнорировала смену сортировки в этом, самом частом, случае.
+      await renderAlbumsView();
+      if (State.albumHandle) {
+        const row = State.folderRows.get(State.albumHandle);
+        if (row) highlightFolderRow(row);
       }
       return;
     }
@@ -3872,6 +3887,58 @@ function init() {
       refreshAlbumsGlobe();
       return;
     }
+    if (data.type === "globe-entered-album") {
+      // Нырок с глобуса шлёт openAlbumIndex и globe-entered-album ОДНИМ сообщением (не
+      // двумя раздельными postMessage, как было раньше) — раньше это был реальный источник
+      // бага: слушатель "message" async, и каждое сообщение диспетчится своим отдельным
+      // вызовом, так что ветка globe-entered-album успевала вызвать refreshMaps() ДО того,
+      // как соседний вызов для openAlbumIndex дожидался открытия альбома — глобус получал
+      // activeIndex ещё от предыдущего состояния (или -1, если альбом вообще не был открыт),
+      // из-за чего его внутренняя логика фокуса необратимо ломалась на весь сеанс режима
+      // альбома (переставал срабатывать зум-выход). Открытие альбома теперь всегда
+      // дожидаемся здесь же, ДО того как включить globeAlbumMode и позвать refreshMaps().
+      if (typeof data.openAlbumIndex === "number") {
+        const entry = State.albumsList[data.openAlbumIndex];
+        if (entry) {
+          const row = State.folderRows.get(entry.handle);
+          if (row) highlightFolderRow(row);
+          await openAlbum(entry.handle);
+          try {
+            await idbSet("lastFocusedPath", folderNamePath(entry.handle));
+          } catch (_) {
+            // необязательная удобная фича
+          }
+        }
+      }
+      State.globeAlbumMode = true;
+      refreshMaps(); // сразу шлём точки текущего альбома — иначе первая карта пуста до смены фото
+      return;
+    }
+    if (data.type === "globe-left-album") {
+      State.globeAlbumMode = false;
+      return;
+    }
+    if (data.type === "globe-preview-album") {
+      // Лёгкая подсветка строки альбома-кандидата в проводнике во время "зоны принятия
+      // решения" на глобусе (см. Часть C плана) — намеренно НЕ вызывает openAlbum():
+      // полное открытие сканирует диск и перестраивает сетку фото на каждую смену цели
+      // при простом вращении, это было бы слишком дорого для живого отклика.
+      if (typeof data.index === "number") {
+        const entry = State.albumsList[data.index];
+        const row = entry && State.folderRows.get(entry.handle);
+        if (row) highlightFolderRow(row);
+      }
+      return;
+    }
+    if (data.type === "globe-preview-clear") {
+      // вышли из зоны принятия решения без нырка/клика — вернуть подсветку строке
+      // реально открытого сейчас альбома (если есть), а не оставлять чужую строку
+      // подсвеченной без основания
+      const row = State.albumHandle && State.folderRows.get(State.albumHandle);
+      if (row) highlightFolderRow(row);
+      else el("folder-tree").querySelectorAll(".folder-node-row.active").forEach((r) => r.classList.remove("active"));
+      return;
+    }
     if (typeof data.focusIndex === "number") {
       goToPhoto(data.focusIndex);
       return;
@@ -3892,6 +3959,11 @@ function init() {
     if (e.source === State.mapWindow && typeof data.lat === "number" && typeof data.lon === "number") {
       setCurrentGeo(data.lat, data.lon);
     }
+  });
+  // окно глобуса — отдельная вкладка ОС, она не закрывается сама вместе с этой страницей;
+  // без этого при закрытии приложения глобус остаётся висеть и больше не получает сообщений
+  window.addEventListener("pagehide", () => {
+    if (State.globeWindow && !State.globeWindow.closed) State.globeWindow.close();
   });
 
   el("open-album-btn").addEventListener("click", pickAlbum);

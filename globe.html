@@ -4,23 +4,56 @@
 <meta charset="UTF-8">
 <title>Глобус альбомов — Albom</title>
 <link rel="icon" href="icons/Globe WIT.png">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
   html, body, #globeViz { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { position: relative; }
+
+  /* оба полноэкранных слоя (глобус и карта альбома) всегда смонтированы одновременно —
+     переключение делает crossfade() ниже плавной сменой прозрачности через .layer-off,
+     а не display:none/hidden, иначе смена выглядела мгновенным "морганием" (жалоба
+     Григория после живой проверки), а у Leaflet при появлении из display:none путался
+     размер контейнера. Портировано из travel-globe/app.js (там этот же переход уже
+     работает) */
+  #globeViz {
+    position: absolute; inset: 0; z-index: 1; transition: opacity 0.35s ease;
+    /* CSS2DRenderer завышает inline z-index у меток самого глобуса на каждом кадре
+       (см. applyActivePin ниже) — без изолированного контекста наложения эти значения
+       "протекают" поверх карты альбома выше по z-index */
+    isolation: isolate;
+  }
+  .layer-off { opacity: 0; pointer-events: none; }
+  #cloudOverlay {
+    position: absolute; inset: 0; z-index: 3; opacity: 0; pointer-events: none;
+    transition: opacity 0.35s ease;
+    /* Григорий: белый "туман" не подошёл — заменили на блюр реальных цветов под слоем
+       (backdrop-filter) плюс лёгкая тёмная дымка в цвет темы приложения (#1b1b1f), а не
+       чужеродное белое пятно поверх глобуса/карты */
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    background: rgba(27, 27, 31, 0.35);
+  }
+  #cloudOverlay.hidden { display: none; }
+  #cloudOverlay.visible { opacity: 1; }
 
   /* капля — единственная кликабельная часть метки (см. .geo-pin ниже); сама обёртка
      pointer-events:none пропускает колесо/перетаскивание глобуса мимо себя, иначе рядом с
      любой меткой зум колесом переставал работать, ожидая клика по всей её площади */
-  .geo-pin-wrap { position: relative; pointer-events: none; }
-  .geo-pin {
+  #globeViz .geo-pin-wrap { position: relative; pointer-events: none; }
+  #globeViz .geo-pin {
     position: relative; width: 18px; height: 18px; border-radius: 50%; background: #4a90d9;
     border: 2px solid #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
     pointer-events: auto; cursor: pointer;
   }
-  /* капля открытого сейчас альбома — см. activeIndex в render(). Подъём над соседними метками
-     (чтобы не терялась среди наложенных капель/подписей) через z-index в JS, не в CSS — см.
-     applyActivePin() в скрипте ниже: three.js CSS2DRenderer сам управляет inline style.zIndex
-     каждой метки, обычное css-правило тут бесполезно */
-  .geo-pin-wrap.active .geo-pin {
+  /* Единственный индикатор фокуса — .active. Раньше здесь было два независимых класса
+     (.active по activeIndex и .targeted по targetedAlbumIndex, зелёное кольцо без подписи),
+     которые могли одновременно указывать на РАЗНЫЕ капли — Григорий после живой проверки:
+     "получается два фокуса... нужен полноценный, однозначный фокус". applyPinStates() ниже
+     теперь считает единый focusIndex (targetedAlbumIndex, если он задан, иначе activeIndex) и
+     применяет .active только к одной капле — подъём над соседними метками через z-index в
+     JS, не в CSS: three.js CSS2DRenderer сам управляет inline style.zIndex каждой метки на
+     каждом кадре, обычное css-правило тут бесполезно */
+  #globeViz .geo-pin-wrap.active .geo-pin {
     background: #ffb020;
     box-shadow: 0 0 0 5px rgba(255, 176, 32, 0.4), 0 1px 3px rgba(0, 0, 0, 0.5);
   }
@@ -30,27 +63,111 @@
      Когда альбомов рядом много, их подписи наползают друг на друга и превращаются в кашу —
      поэтому по умолчанию подпись скрыта и появляется только у активного альбома или при
      наведении на саму каплю (.geo-pin, единственная часть с pointer-events: auto) */
-  .geo-pin-name {
+  #globeViz .geo-pin-name {
     position: absolute; left: 13px; bottom: 8px; transform-origin: left bottom;
     transform: rotate(-40deg); text-align: left; pointer-events: none;
     font: 600 14px/1 system-ui, sans-serif; color: #fff; white-space: nowrap;
     text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 4px rgba(0, 0, 0, 0.9);
     opacity: 0; transition: opacity 120ms ease;
   }
-  .geo-pin-wrap.active .geo-pin-name,
-  .geo-pin:hover + .geo-pin-name {
+  #globeViz .geo-pin-wrap.active .geo-pin-name,
+  #globeViz .geo-pin:hover + .geo-pin-name {
     opacity: 1;
   }
+
+  /* карта фото открытого альбома — второй полноэкранный слой поверх глобуса, см.
+     enterAlbumMode()/exitAlbumMode() ниже; видна вместо глобуса, не поверх него */
+  #album-map-frame { position: absolute; inset: 0; z-index: 2; background: #1b1b1f; transition: opacity 0.35s ease; }
+  #album-map-frame-inner { position: absolute; inset: 0; }
+  #album-back-btn {
+    position: absolute; left: 12px; top: 12px; z-index: 1000;
+    background: rgba(27, 27, 31, 0.85); color: #e8e8ec; border: 1px solid rgba(255, 255, 255, 0.25);
+    font: 600 0.85rem system-ui, sans-serif; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+  }
+
+  /* капля с числом кадров на карте фото альбома — верстка скопирована 1:1 из map.html
+     (см. Часть 3 плана слияния глобуса и карты), другое имя-контейнер (#album-map-frame
+     вместо #globeViz) не даёт этим правилам столкнуться с версткой капель самого глобуса
+     выше — обе стороны используют одни и те же имена классов (geo-pin-wrap/geo-pin) */
+  #album-map-frame .geo-pin-icon { background: transparent; border: none; }
+  #album-map-frame .geo-pin-wrap { display: flex; flex-direction: column; align-items: center; pointer-events: none; }
+  #album-map-frame .geo-pin {
+    width: 22px; height: 22px; border-radius: 50% 50% 50% 0; background: #4a90d9;
+    border: 2px solid #fff; transform: rotate(-45deg); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  }
+  #album-map-frame .geo-pin-num {
+    margin-top: 2px; font: 600 11px/1 system-ui, sans-serif; color: #fff;
+    background: rgba(27, 27, 31, 0.75); border-radius: 3px; padding: 1px 4px;
+  }
+  #album-map-frame .geo-pin-wrap.active .geo-pin { background: #ffb400; width: 28px; height: 28px; }
+  #album-map-frame .geo-pin-wrap.active .geo-pin-num { background: #ffb400; color: #1b1b1f; font-weight: 700; }
 </style>
 </head>
 <body>
 <div id="globeViz"></div>
+<div id="cloudOverlay" class="hidden"></div>
+<div id="album-map-frame" class="layer-off">
+  <div id="album-map-frame-inner"></div>
+  <button id="album-back-btn" type="button">← Глобус</button>
+</div>
 <script src="https://unpkg.com/globe.gl"></script>
 <script src="https://unpkg.com/topojson-client@3"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="geo-markers.js"></script>
 <script>
   let albums = []; // [{index, name, lat, lon}, ...] — по одному на готовый альбом
   let activeIndex = -1; // index (см. albums) альбома, открытого сейчас в главном окне — его каплю подсвечиваем
   let lastAlbumsSignature = null; // общий обзор пересчитываем только когда меняется сам набор альбомов
+
+  // Режим "внутри альбома" — второй полноэкранный слой (карта фото этого альбома) вместо
+  // глобуса, см. Часть 3 плана слияния. Пока активен, внешний глобус заморожен (скрыт, не
+  // крутится) — Григорий явно просил не показывать два окна одновременно.
+  //
+  // Вход/выход и сам переход портированы с travel-globe/app.js (там этот же переход уже
+  // проверен и работает) вместо черновой схемы "N тиков колеса над каплей" — та на живой
+  // проверке сработала плохо: входила слишком рано, выходила слишком поздно или не
+  // срабатывала вовсе повторно (см. разбор в плане, раздел "Часть 3").
+  let albumMode = false;
+  let currentAlbumIndex = -1;
+  let photoPoints = []; // State.albumGeo из app.js — координаты фото ТЕКУЩЕГО открытого альбома
+  let photoActiveIndex = -1;
+  let albumMap = null; // Leaflet-карта фото альбома, создаётся один раз при первом входе
+  const albumMarkersRef = { list: [] };
+  let lastPhotoFocusKey = null;
+  let lastPhotoPointsSignature = null;
+  // Сразу после входа карта должна показать альбом целиком (fitBounds), а не прыгать на
+  // activeIndex, который к первому рендеру уже пришёл от главного окна — см.
+  // renderAlbumMap() ниже. Сбрасывается в false при каждом входе (enterAlbumMode).
+  let albumViewInitialized = false;
+  // activeIndex, с которым мы вошли в альбом — пока пользователь его не сменил (не
+  // перешёл к другому фото), продолжаем показывать альбом целиком, наращивая охват по
+  // мере того как приходят новые геоточки асинхронного скана (см. renderAlbumMap)
+  let albumEntryActiveIndex = null;
+  // Зум выхода — Григорий явно попросил выход отдалением колесом, симметрично входу на
+  // глобусе (см. onAlbumMapZoomEnd ниже). albumBaselineZoom — зум последнего вида, который
+  // МЫ САМИ выставили программно (весь альбом целиком либо конкретное сфокусированное фото).
+  // Выставляется СИНХРОННО прямо в момент вызова fitBounds/setView (через getBoundsZoom() —
+  // тот же расчёт, что fitBounds делает внутри себя, но без ожидания анимации), а НЕ по
+  // событию zoomend: при animate:true Leaflet обновляет getZoom() только ПОСЛЕ завершения
+  // анимации (проверено эмпирически) — ожидание zoomend для фиксации опорного уровня
+  // оставляло окно, в которое мог влезть настоящий зум-жест пользователя и получить
+  // неверно приписанный опорный зум. Раньше это решалось флагом albumProgrammaticZoom +
+  // подстраховочным таймером, но флаг лишь ОТКЛАДЫВАЛ проблему — окно гонки оставалось,
+  // просто более узким; синхронный расчёт закрывает её полностью.
+  let albumBaselineZoom = null;
+  // Короткая блокировка зума колесом сразу после входа/нырка в альбом — Григорий пожаловался,
+  // что при входе продолжаешь крутить колесо по инерции ровно в момент подмены слоя, и это же
+  // движение колеса тут же зумит уже саму карту ("долго крутишь колесо и потом очень резко
+  // влетаешь на карту... пролетаешь и упираешься в карту"). Пауза даёт глазу время увидеть
+  // карту до того, как колесо снова начнёт её зумить.
+  let albumZoomCooldownTimer = null;
+  const ALBUM_ZOOM_COOLDOWN_MS = 450;
+  function pauseAlbumMapZoom() {
+    const m = ensureAlbumMap();
+    m.scrollWheelZoom.disable();
+    clearTimeout(albumZoomCooldownTimer);
+    albumZoomCooldownTimer = setTimeout(() => m.scrollWheelZoom.enable(), ALBUM_ZOOM_COOLDOWN_MS);
+  }
 
   // Инициализация — один в один с travel-globe/app.js: локальная 8k-текстура Земли вместо
   // дефолтной низкодетальной из three-globe, анизотропная фильтрация после асинхронной
@@ -73,15 +190,49 @@
       wrap.dataset.index = a.index;
       wrap.innerHTML = `<div class="geo-pin"></div><div class="geo-pin-name">${a.name}</div>`;
       // клик открывает альбом только по самой капле (не по всей обёртке с подписью) — см.
-      // pointer-events на .geo-pin-wrap выше
-      wrap.querySelector(".geo-pin").onclick = (e) => {
+      // pointer-events на .geo-pin-wrap выше. Клик обязан вести себя ровно как раньше —
+      // Григорий явно просил не проваливаться в альбом от клика (см. enterAlbumMode ниже),
+      // чтобы не портить кайф от просто покрутить/покликать по глобусу
+      const pinEl = wrap.querySelector(".geo-pin");
+      // клик открывает альбом только по самой капле (не по всей обёртке с подписью) — см.
+      // pointer-events на .geo-pin-wrap выше. Клик обязан вести себя ровно как раньше —
+      // Григорий явно просил не проваливаться в альбом от клика (см. enterAlbumMode ниже),
+      // чтобы не портить кайф от просто покрутить/покликать по глобусу. Само наведение и
+      // счётчик тиков зума для входа в альбом — не здесь, а в общем делегированном
+      // обработчике на #globeViz (см. ниже) — см. его комментарий, почему не на самой капле.
+      pinEl.onclick = (e) => {
         e.stopPropagation();
-        if (window.opener && !window.opener.closed) {
-          window.opener.postMessage({ openAlbumIndex: a.index }, "*");
-        }
+        steerToAlbum(a);
+        openAlbumInMain(a.index);
       };
       return wrap;
     });
+
+  // .geo-pin — HTML-элемент поверх WebGL-канваса (CSS2D-слой three.js), а не его потомок,
+  // поэтому колесо мыши, наведённое на каплю, до OrbitControls (слушает канвас) не долетает
+  // само по себе — при тесном скоплении альбомов капли перекрывают почти всю область под
+  // курсором, и зум переставал работать, пока не отведёшь мышь в сторону. Пробрасываем
+  // событие на канвас вручную (Round 5) — это нужно независимо от механизма входа в
+  // альбом ниже (checkGlobeDive), иначе зум над плотным скоплением меток вообще не крутит
+  // камеру.
+  const globeVizNode = document.getElementById("globeViz");
+  globeVizNode.addEventListener("wheel", (e) => {
+    if (e.__albomForwarded) return; // наша же синтетическая копия ниже — не обрабатываем повторно
+    const pinWrap = e.target.closest && e.target.closest(".geo-pin-wrap");
+    if (pinWrap) {
+      e.preventDefault();
+      const canvas = document.querySelector("#globeViz canvas");
+      if (canvas) {
+        const forwarded = new WheelEvent("wheel", {
+          bubbles: true, cancelable: true,
+          deltaX: e.deltaX, deltaY: e.deltaY, deltaZ: e.deltaZ, deltaMode: e.deltaMode,
+          clientX: e.clientX, clientY: e.clientY, ctrlKey: e.ctrlKey,
+        });
+        forwarded.__albomForwarded = true;
+        canvas.dispatchEvent(forwarded);
+      }
+    }
+  }, { passive: false });
 
   globe.renderer().setPixelRatio(window.devicePixelRatio);
   // сама Земля на фоне чёрного космоса выходит слишком тёмной и плохо отличима от фона —
@@ -127,6 +278,178 @@
   window.addEventListener("resize", resizeGlobe);
   new ResizeObserver(resizeGlobe).observe(globeVizEl);
 
+  // Кросс-фейд между глобусом и картой альбома — портировано дословно с
+  // travel-globe/app.js (crossfade()): оба слоя всё время смонтированы, меняется только
+  // прозрачность через .layer-off, плюс короткая "дымка" (#cloudOverlay) поверх обоих
+  // слоёв на время переключения — это и есть то самое сглаживание, которого не хватало
+  // в черновой версии с мгновенным hidden=true/false.
+  // Длительность перехода — сначала было 280мс, Григорий пожаловался на слишком резкий
+  // влёт на карту после медленного накатывания на глобусе, увеличили до 500мс. После живой
+  // проверки — обратная жалоба, 500мс тянет "пелену" перехода слишком долго. 350мс —
+  // компромисс между двумя жалобами (см. CSS ниже — transition: opacity подогнан под то же
+  // число).
+  const CROSSFADE_MS = 350;
+  const cloudOverlayEl = document.getElementById("cloudOverlay");
+  function crossfade(fromEl, toEl, onSwap) {
+    cloudOverlayEl.classList.remove("hidden");
+    requestAnimationFrame(() => cloudOverlayEl.classList.add("visible"));
+    onSwap();
+    requestAnimationFrame(() => {
+      fromEl.classList.add("layer-off");
+      toEl.classList.remove("layer-off");
+    });
+    setTimeout(() => {
+      cloudOverlayEl.classList.remove("visible");
+      setTimeout(() => cloudOverlayEl.classList.add("hidden"), CROSSFADE_MS);
+    }, CROSSFADE_MS);
+  }
+
+  // Ближайший к текущему взгляду камеры альбом — haversine по координатам albums,
+  // портировано с travel-globe/app.js (nearestTrip). При деливе камера и так обычно
+  // наведена на нужную каплю (иначе бы к ней не приближались), поэтому не нужно требовать
+  // точного наведения курсора именно на DOM-элемент капли — тот всё равно "уезжает"
+  // из-под курсора при приближении (CSS2DRenderer пересчитывает его позицию каждый кадр).
+  function haversineKm(lat1, lng1, lat2, lng2) {
+    const R = 6371;
+    const toRad = (deg) => (deg * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const x = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(x));
+  }
+
+  function nearestAlbum(lat, lng) {
+    if (!albums.length) return null;
+    let best = albums[0];
+    let bestDist = Infinity;
+    albums.forEach((a) => {
+      const d = haversineKm(lat, lng, a.lat, a.lon);
+      if (d < bestDist) { bestDist = d; best = a; }
+    });
+    return best;
+  }
+
+  // Высота принятия решения — раньше это был единственный порог входа (история числа —
+  // ниже). Григорий явно попросил разбить его на два: DECISION_ALTITUDE_MARGIN — та же
+  // высота, что раньше была порогом входа, с неё начинается "зона принятия решения", в
+  // которой лишь подсвечивается ближайший к центру альбом-кандидат (targetedAlbumIndex,
+  // см. ниже), а сам нырок коммитится позже, у DIVE_ALTITUDE_MARGIN — небольшого
+  // дополнительного запаса по высоте ниже. Раньше единственный порог означал, что решение о
+  // том, в какой альбом нырнуть, принималось В ТОТ ЖЕ МОМЕНТ, что и сам нырок — отсюда жалоба
+  // "почти наверняка промахиваюсь": на такой высоте уже плохо видно, а кандидат нигде не
+  // подсвечивался заранее.
+  // Было 0.03 (дословно портировано с travel-globe/app.js) — Григорий пожаловался, что зум
+  // на глобус происходит слишком медленно, увеличено втрое до 0.09. Это и стало
+  // DECISION_ALTITUDE_MARGIN.
+  const DECISION_ALTITUDE_MARGIN = 0.09;
+  // Сам порог нырка — заметно ближе DECISION_ALTITUDE_MARGIN, даёт тот самый "зазор по
+  // высоте", который Григорий явно попросил ("даём ещё немного опуститься"). Черновой
+  // коэффициент, требует подбора по ощущениям на живой проверке.
+  const DIVE_ALTITUDE_MARGIN = DECISION_ALTITUDE_MARGIN * 0.6;
+  // Масштаб, на который возвращается камера глобуса при выходе (см. exitAlbumMode ниже) —
+  // Григорий явно попросил СТРОГО тот же масштаб, что и при входе, а не кратный привязанный
+  // множитель, как было раньше (был EXIT_ALTITUDE = DIVE_ALTITUDE_MARGIN * 6, что и
+  // ощущалось как "улетаем на луну"). Ровно тот же масштаб проверено НЕ работает: живой
+  // прогон теста поймал реальный дребезг — если EXIT_ALTITUDE в точности равен порогу входа,
+  // то после того как истекает временная блокировка ниже (diveSuppressedUntil), фоновый опрос
+  // checkGlobeDive (каждые 250мс) сам застаёт камеру ровно на границе порога и молча
+  // проваливает обратно в альбом — причём в тот, что оказался ближе к случайной последней
+  // точке обзора, а не туда, куда целился Григорий. Это не гипотетическая осторожность —
+  // именно так и произошло при прогоне check_globe_album_dive.js. Берём небольшой, но
+  // настоящий геометрический запас от DECISION_ALTITUDE_MARGIN (а не от нового, меньшего
+  // DIVE_ALTITUDE_MARGIN — иначе выход оказался бы даже ближе, чем сама зона принятия
+  // решения, что бессмысленно).
+  const EXIT_ALTITUDE = DECISION_ALTITUDE_MARGIN * 1.4;
+  // Дополнительная короткая блокировка повторного входа сразу после выхода — запас на случай,
+  // если геометрический зазор выше окажется недостаточным при живой проверке (не единственная
+  // защита от зацикливания, а вторая линия обороны).
+  let diveSuppressedUntil = 0;
+  const DIVE_REENTRY_COOLDOWN_MS = 1000;
+
+  // Альбом-кандидат "на прицеле" — тот, в который нырок сработает ПРЯМО СЕЙЧАС, продолжи
+  // снижение. Не то же самое, что activeIndex (альбом, уже открытый в главном окне) — во
+  // время зоны принятия решения цель может быть вообще нигде не открыта; пока она задана
+  // (!== -1), applyPinStates() ниже отдаёт ей приоритет над activeIndex как единственному
+  // источнику подсветки .active (см. комментарий у applyPinStates и у CSS .active выше —
+  // раньше это был отдельный класс .targeted, который мог гореть одновременно с .active на
+  // другой капле). Клик по капле (см. .htmlElement выше) тоже выставляет эту цель через
+  // steerToAlbum — Григорий явно разделил "подрулить камерой" и "нырнуть": клик ни к чему не
+  // обязывает, глобус можно крутить дальше.
+  let targetedAlbumIndex = -1;
+  function setTargetedAlbum(index) {
+    if (targetedAlbumIndex === index) return;
+    targetedAlbumIndex = index;
+    applyPinStates();
+  }
+
+  // Подрулка камеры к альбому без изменения масштаба — Григорий явно попросил "зум не
+  // трогаем", поэтому altitude берётся ТЕКУЩАЯ, а не какое-то фиксированное число.
+  // steeringUntil — короткая блокировка живого пересчёта цели (см. checkGlobeDive ниже) на
+  // время самой анимации подрулки, чтобы не дёргать фокус на другой альбом посреди неё же.
+  const STEER_DURATION_MS = 700; // черновое значение, требует подбора по ощущениям
+  let steeringUntil = 0;
+  function steerToAlbum(album) {
+    const pov = globe.pointOfView();
+    globe.pointOfView({ lat: album.lat, lng: album.lon, altitude: pov.altitude }, STEER_DURATION_MS);
+    steeringUntil = Date.now() + STEER_DURATION_MS;
+    setTargetedAlbum(album.index);
+  }
+
+  // Опрос состояния нырка — раз в 250мс (подстраховка) и, дополнительно, на каждое реальное
+  // изменение камеры (см. globe.controls().addEventListener("change", ...) ниже) — Григорий
+  // явно попросил, чтобы подсветка цели "перескакивала" на ближайший к центру альбом ЖИВО, по
+  // мере вращения глобуса внутри зоны принятия решения, а не только раз в четверть секунды.
+  // Имя функции и её роль единственной точки коммита нырка не менялись — это важно: тесты
+  // check_globe_album_dive.js/check_globe_dive_focus_and_exit_position.js вызывают её
+  // напрямую по имени и читают DIVE_ALTITUDE_MARGIN как обычную переменную скрипта.
+  function checkGlobeDive() {
+    if (albumMode || !albums.length || Date.now() < diveSuppressedUntil) return;
+    if (Date.now() < steeringUntil) return; // не дёргаем цель поверх ещё не доигравшей подрулки
+    const camera = globe.camera();
+    const dist = camera.position.length();
+    const globeRadius = globe.getGlobeRadius();
+    const minDist = globe.controls().minDistance;
+    const decisionThresholdDist = minDist + globeRadius * DECISION_ALTITUDE_MARGIN;
+    if (dist > decisionThresholdDist) {
+      // вышли из зоны принятия решения, не нырнув и не кликнув — сбрасываем живую цель и
+      // возвращаем подсветку в проводнике реально открытому альбому (см. clearAlbumPreview
+      // ниже), иначе фокус залипал бы на последнем кандидате навсегда
+      if (targetedAlbumIndex !== -1) {
+        setTargetedAlbum(-1);
+        clearAlbumPreview();
+      }
+      return;
+    }
+    const pov = globe.pointOfView();
+    const target = nearestAlbum(pov.lat, pov.lng);
+    if (!target) return;
+    if (target.index !== targetedAlbumIndex) {
+      setTargetedAlbum(target.index);
+      previewAlbumInMain(target.index);
+    }
+    const diveThresholdDist = minDist + globeRadius * DIVE_ALTITUDE_MARGIN;
+    if (dist <= diveThresholdDist) enterAlbumMode(target.index);
+  }
+  // Зона принятия решения теперь охватывает целый диапазон высот (а не одну пороговую точку,
+  // как было раньше), поэтому checkGlobeDive() выполняет свою работу (haversine-перебор в
+  // nearestAlbum + переключение DOM-классов в applyPinStates) НЕПРЕРЫВНО в течение всего
+  // приближения, а не в одной точке — Григорий после живой проверки: "стало зуммироваться
+  // рывками". OrbitControls может выстрелить несколько событий "change" за один рендер-кадр;
+  // коалесцируем их через requestAnimationFrame, чтобы checkGlobeDive реально выполнялась не
+  // чаще раза за кадр. Сама checkGlobeDive не меняется и по-прежнему вызывается по имени
+  // напрямую в тестах (см. комментарий у её объявления) — throttle только в подписке ниже.
+  let checkGlobeDivePending = false;
+  function scheduleCheckGlobeDive() {
+    if (checkGlobeDivePending) return;
+    checkGlobeDivePending = true;
+    requestAnimationFrame(() => {
+      checkGlobeDivePending = false;
+      checkGlobeDive();
+    });
+  }
+  globe.controls().addEventListener("change", scheduleCheckGlobeDive);
+  setInterval(checkGlobeDive, 250);
+
   function albumsSignature(list) {
     return list.map((a) => `${a.index}:${a.lat.toFixed(6)},${a.lon.toFixed(6)}`).join(";");
   }
@@ -140,26 +463,33 @@
   // Поэтому после её же перезаписи выставляем активной капле zIndex с большим запасом
   // (см. MutationObserver ниже, который ловит именно эти перезаписи style)
   const ACTIVE_PIN_Z_INDEX = "999999";
-  function applyActivePin() {
+  function applyPinStates() {
+    // единый фокус: пока камера в зоне принятия решения (targetedAlbumIndex !== -1),
+    // подсветка следует за живым кандидатом на нырок; иначе — за реально открытым сейчас
+    // альбомом. Ровно одна капля получает .active в любой момент времени (см. комментарий у
+    // CSS .active выше — раньше здесь были два независимых класса, которые могли гореть
+    // одновременно на разных каплях).
+    const focusIndex = targetedAlbumIndex !== -1 ? targetedAlbumIndex : activeIndex;
     document.querySelectorAll(".geo-pin-wrap").forEach((wrap) => {
-      const isActive = Number(wrap.dataset.index) === activeIndex;
-      wrap.classList.toggle("active", isActive);
-      if (isActive && wrap.style.zIndex !== ACTIVE_PIN_Z_INDEX) wrap.style.zIndex = ACTIVE_PIN_Z_INDEX;
+      const idx = Number(wrap.dataset.index);
+      const isFocused = idx === focusIndex;
+      wrap.classList.toggle("active", isFocused);
+      if (isFocused && wrap.style.zIndex !== ACTIVE_PIN_Z_INDEX) wrap.style.zIndex = ACTIVE_PIN_Z_INDEX;
     });
   }
 
   // DOM-узлы меток three-globe вставляет не синхронно с вызовом htmlElementsData() (а на одном
-  // из следующих кадров рендера) — обычный вызов applyActivePin() сразу после него их ещё не
+  // из следующих кадров рендера) — обычный вызов applyPinStates() сразу после него их ещё не
   // застаёт, поэтому дополнительно ловим появление меток наблюдателем за DOM. attributes/style —
   // именно та самая перезапись zIndex по глубине на каждом кадре (см. комментарий у
-  // applyActivePin): ловим её и тут же возвращаем активной капле её большой zIndex обратно
-  new MutationObserver(applyActivePin).observe(document.getElementById("globeViz"), {
+  // applyPinStates): ловим её и тут же возвращаем активной/целевой капле её большой zIndex обратно
+  new MutationObserver(applyPinStates).observe(document.getElementById("globeViz"), {
     childList: true, subtree: true, attributes: true, attributeFilter: ["style"],
   });
 
   function render() {
     globe.htmlElementsData(albums);
-    applyActivePin();
+    applyPinStates();
     const sig = albumsSignature(albums);
     if (sig !== lastAlbumsSignature) {
       lastAlbumsSignature = sig;
@@ -172,13 +502,227 @@
     document.title = albums.length ? `Глобус альбомов (${albums.length}) — Albom` : "Глобус альбомов — Albom";
   }
 
+  // открывает альбом в главном окне — общая ветка и для обычного клика по капле (поведение не
+  // меняется), и для входа жестом зума (enterAlbumMode ниже)
+  function openAlbumInMain(index) {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({ openAlbumIndex: index }, "*");
+    }
+  }
+
+  // Лёгкая подсветка строки альбома-кандидата в дереве папок главного окна, пока камера
+  // находится в зоне принятия решения — Григорий: "без... перехода фокуса в проводнике".
+  // Намеренно НЕ вызывает openAlbum() (тот сканирует диск и перестраивает сетку фото на
+  // каждый вызов, см. app.js) — это было бы слишком дорого при каждой смене живой цели
+  // простым вращением глобуса.
+  function previewAlbumInMain(index) {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({ type: "globe-preview-album", index }, "*");
+    }
+  }
+  function clearAlbumPreview() {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({ type: "globe-preview-clear" }, "*");
+    }
+  }
+
+  // вход в режим альбома — коммитится только когда камера сама подошла вплотную к
+  // минимальной дистанции зума (см. checkGlobeDive выше), никогда по клику.
+  // Открытие альбома (openAlbumIndex) и переход в режим карты (globe-entered-album) —
+  // раньше были ДВУМЯ отдельными postMessage. У app.js один слушатель "message", но он
+  // async, и каждое сообщение диспетчится отдельным независимым вызовом — awaiting
+  // openAlbum() внутри обработки первого сообщения НЕ блокирует обработку второго, они
+  // гонялись параллельно. Если до нырка альбом ещё не был открыт (State.index===-1,
+  // "без фокуса"), обработчик "globe-entered-album" успевал вызвать refreshMaps() и
+  // прислать сюда activeIndex:-1 РАНЬШЕ, чем openAlbum() успевал выставить настоящий
+  // индекс — albumEntryActiveIndex защёлкивался на -1, и первый же реальный activeIndex
+  // (0) ошибочно засчитывался за "пользователь сам сменил фото" (см. renderAlbumMap),
+  // альбом целиком (fitBounds/albumBaselineZoom) так и не показывался, и зум-выход
+  // переставал работать насовсем до следующего входа. Теперь оба действия идут ОДНИМ
+  // сообщением — app.js обязан сначала дождаться openAlbum(), и только потом включить
+  // globeAlbumMode/refreshMaps(), без гонки между двумя отдельными вызовами обработчика.
+  function enterAlbumMode(albumIndex) {
+    if (albumMode) return;
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({ type: "globe-entered-album", openAlbumIndex: albumIndex }, "*");
+    }
+    currentAlbumIndex = albumIndex;
+    albumMode = true;
+    setTargetedAlbum(-1);
+    albumViewInitialized = false;
+    albumEntryActiveIndex = null;
+    albumBaselineZoom = null;
+    crossfade(document.getElementById("globeViz"), document.getElementById("album-map-frame"), () => {
+      ensureAlbumMap();
+      pauseAlbumMapZoom();
+      requestAnimationFrame(() => albumMap.invalidateSize());
+    });
+  }
+
+  // выход — либо кнопкой "← Глобус" (гарантированный запасной путь, никогда не запирает
+  // пользователя), либо отдалением колесом на самой карте (см. onAlbumMapZoomEnd ниже —
+  // Григорий явно попросил зум-выход симметрично зум-входу на глобусе, взамен более раннего
+  // варианта "только кнопка", портированного из travel-globe и оказавшегося недостаточным
+  // на живой проверке).
+  function exitAlbumMode() {
+    if (!albumMode) return;
+    // Куда возвращать камеру глобуса — реальные координаты самого альбома, а НЕ
+    // albumMap.getCenter(): Leaflet при зуме колесом зумирует к точке ПОД КУРСОРОМ, а не к
+    // центру карты — после нескольких тиков зум-выхода центр вида мог уехать далеко в
+    // сторону от альбома, тем сильнее, чем ближе курсор был к краю карты в момент выхода.
+    // Из-за этого место приземления на глобусе ощутимо скакало в зависимости от того, где
+    // стоял курсор при выходе — координаты альбома фиксированы и от курсора не зависят.
+    // currentAlbumIndex — это a.index (см. albums ниже), а не позиция в массиве, поэтому
+    // ищем через find, а не albums[currentAlbumIndex] (см. activeIndex/applyActivePin выше).
+    const exitAlbum = albums.find((a) => a.index === currentAlbumIndex);
+    albumMode = false;
+    currentAlbumIndex = -1;
+    setTargetedAlbum(-1);
+    photoPoints = [];
+    photoActiveIndex = -1;
+    lastPhotoFocusKey = null;
+    lastPhotoPointsSignature = null;
+    albumViewInitialized = false;
+    albumEntryActiveIndex = null;
+    albumBaselineZoom = null;
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({ type: "globe-left-album" }, "*");
+    }
+    diveSuppressedUntil = Date.now() + DIVE_REENTRY_COOLDOWN_MS;
+    crossfade(document.getElementById("album-map-frame"), document.getElementById("globeViz"), () => {
+      resizeGlobe();
+      const lat = exitAlbum ? exitAlbum.lat : albums.reduce((s, a) => s + a.lat, 0) / (albums.length || 1);
+      const lng = exitAlbum ? exitAlbum.lon : albums.reduce((s, a) => s + a.lon, 0) / (albums.length || 1);
+      globe.pointOfView({ lat, lng, altitude: EXIT_ALTITUDE }, 0);
+    });
+  }
+
+  // Насколько нужно отдалиться КОЛЕСОМ относительно текущего опорного вида (весь альбом
+  // либо конкретное сфокусированное фото — см. albumBaselineZoom), чтобы это засчиталось
+  // за явный жест выхода, а не случайный одиночный тик. Меряем в уровнях зума относительно
+  // опорного, а не абсолютным числом — абсолютный порог (как в travel-globe) либо
+  // срабатывал слишком поздно для тесных альбомов, либо мог сработать сразу при входе для
+  // альбомов с большим георазбросом, где даже вид "целиком" уже сильно отдалён.
+  // Гистерезис выхода — Григорий: "выход при удалении происходит в то же место что и вход,
+  // с тем же масштабом... я бы применил петлю гистерезиса, и выход можно делать гораздо
+  // позже". Было 2 — увеличено, чтобы требовался заметно больший отход колесом от опорного
+  // вида, прежде чем это засчитается за жест выхода.
+  const EXIT_ZOOM_MARGIN = 4;
+  function onAlbumMapZoomEnd() {
+    if (!albumMode || albumBaselineZoom === null) return;
+    // раньше при близком соседнем альбоме тут был автоматический "нырок" сразу в него,
+    // минуя глобус — Григорий забраковал на живой проверке: переход происходил не туда,
+    // куда он целился, ощущался навязчивым и дезориентирующим ("перескакивание по
+    // порядку"). Выход теперь всегда один и тот же — обратно на глобус; чтобы долететь до
+    // другого альбома, Григорий явно предпочитает сам кликнуть по нему на глобусе, а не
+    // чтобы это решали за него.
+    if (albumMap.getZoom() <= albumBaselineZoom - EXIT_ZOOM_MARGIN) exitAlbumMode();
+  }
+
+  // инициализация Leaflet-карты фото альбома — порядок в точности как в map.html:
+  // L.map() → tileLayer().addTo() → setView() ДО расстановки маркеров, иначе Leaflet считает
+  // размеры по ещё скрытому контейнеру и все капли потом съезжают
+  function ensureAlbumMap() {
+    if (albumMap) return albumMap;
+    albumMap = L.map("album-map-frame-inner", { attributionControl: true });
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "© OpenStreetMap",
+    }).addTo(albumMap);
+    albumMap.setView([20, 0], 2);
+    albumMap.on("zoomend", onAlbumMapZoomEnd);
+    return albumMap;
+  }
+
+  function photoPointsSignature(pts) {
+    return pts.map((p) => (p ? p.lat.toFixed(6) + "," + p.lon.toFixed(6) : "")).join(";");
+  }
+
+  // рендер карты фото альбома — по мотивам render() в map.html, с одним отличием: пока
+  // пользователь ещё не перешёл к другому фото (не сменил activeIndex относительно того,
+  // с которым мы вошли в альбом), карта всегда показывает альбом целиком (fitBounds), а не
+  // прыгает на activeIndex. Взводить этот режим "готово" на первой найденной точке
+  // ОШИБКА — geo-скан альбома в app.js асинхронный и прогрессивный (collectAlbumGeo шлёт
+  // refreshMaps() по мере нахождения каждого фото по отдельности): при таком взводе
+  // единственная первая найденная точка "запирала" карту на zoom 14 одного фото ещё до
+  // того, как остальные точки альбома успевали прийти (жалоба Григория "вход на одну
+  // точку" после живой проверки). Поэтому вместо триггера "точки появились" — триггер
+  // "пользователь сам сменил фото": пока activeIndex не отличается от того, с которым мы
+  // вошли, каждый рендер просто расширяет fitBounds на все точки, что успели прийти к
+  // этому моменту. По духу портировано с travel-globe/app.js#goToMapAt (там то же самое
+  // решается через bounds при отсутствии конкретного highlightIndex).
+  function renderAlbumMap() {
+    if (!albumMode) return;
+    const m = ensureAlbumMap();
+    syncGeoMarkers(L, m, albumMarkersRef, photoPoints, photoActiveIndex, (indexes) => {
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage({ focusIndex: pickClusterTarget(indexes, photoActiveIndex) }, "*");
+      }
+    });
+    if (albumEntryActiveIndex === null) albumEntryActiveIndex = photoActiveIndex;
+    if (!albumViewInitialized && photoActiveIndex !== albumEntryActiveIndex) {
+      albumViewInitialized = true; // пользователь сам перешёл к другому фото — дальше обычная логика фокуса
+    }
+    const known = photoPoints.filter(Boolean);
+    if (!albumViewInitialized) {
+      // Григорий: "при открытии карты не хватает плавности" — этот самый первый показ
+      // альбома целиком раньше ставился мгновенным animate:false, из-за чего карта буквально
+      // телепортировалась в кадр альбома сразу же, как только проступала из-под кроссфейда.
+      // Тут включаем настоящую анимацию Leaflet. albumBaselineZoom считаем через
+      // getBoundsZoom() ДО вызова fitBounds — тот же расчёт, что fitBounds сделает внутри
+      // себя, но синхронно и сразу, не дожидаясь конца анимации (см. комментарий у
+      // объявления albumBaselineZoom выше, почему НЕ через zoomend).
+      if (known.length > 1) {
+        const bounds = L.latLngBounds(known.map((p) => [p.lat, p.lon])).pad(0.2);
+        albumBaselineZoom = m.getBoundsZoom(bounds);
+        m.fitBounds(bounds, { animate: true });
+      } else if (known.length === 1) {
+        albumBaselineZoom = 14;
+        m.setView([known[0].lat, known[0].lon], 14, { animate: true });
+      }
+      const cur0 = photoPoints[photoActiveIndex];
+      lastPhotoFocusKey = cur0 ? `${photoActiveIndex}:${cur0.lat.toFixed(6)},${cur0.lon.toFixed(6)}` : `none:${photoActiveIndex}`;
+      lastPhotoPointsSignature = photoPointsSignature(photoPoints);
+      requestAnimationFrame(() => m.invalidateSize());
+      return;
+    }
+    const cur = photoPoints[photoActiveIndex];
+    const focusKey = cur ? `${photoActiveIndex}:${cur.lat.toFixed(6)},${cur.lon.toFixed(6)}` : `none:${photoActiveIndex}`;
+    if (focusKey !== lastPhotoFocusKey) {
+      lastPhotoFocusKey = focusKey;
+      if (cur) {
+        albumBaselineZoom = 16;
+        m.setView([cur.lat, cur.lon], 16, { animate: false });
+      }
+    }
+    const sig = photoPointsSignature(photoPoints);
+    if (sig !== lastPhotoPointsSignature) {
+      lastPhotoPointsSignature = sig;
+      if (!cur && known.length) {
+        const bounds = L.latLngBounds(known.map((p) => [p.lat, p.lon])).pad(0.2);
+        albumBaselineZoom = m.getBoundsZoom(bounds);
+        m.fitBounds(bounds, { animate: false });
+      }
+    }
+    requestAnimationFrame(() => m.invalidateSize());
+  }
+
+  document.getElementById("album-back-btn").addEventListener("click", exitAlbumMode);
+
   window.addEventListener("message", (e) => {
     if (e.source !== window.opener) return;
     const data = e.data || {};
-    if (!Array.isArray(data.albums)) return;
-    albums = data.albums;
-    activeIndex = typeof data.activeIndex === "number" ? data.activeIndex : -1;
-    render();
+    if (Array.isArray(data.albums)) {
+      albums = data.albums;
+      activeIndex = typeof data.activeIndex === "number" ? data.activeIndex : -1;
+      render();
+      return;
+    }
+    if (Array.isArray(data.points)) {
+      photoPoints = data.points;
+      photoActiveIndex = typeof data.activeIndex === "number" ? data.activeIndex : -1;
+      renderAlbumMap();
+    }
   });
 
   // сигнализируем главному окну, что можно присылать данные — открытие окна и первое

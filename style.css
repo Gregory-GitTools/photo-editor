@@ -250,8 +250,18 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .properties-map-buttons {
   display: flex;
+  align-items: center;
   gap: 8px;
   margin-top: 10px;
+}
+
+/* отделяет #globe-btn от пары кнопок карты — та же группа "карта", но другая ось
+   включения (State.albumsViewActive, а не геоданные текущего фото), не должна читаться
+   как третья кнопка одной группы */
+.properties-map-buttons-sep {
+  width: 1px;
+  height: 21px;
+  background: rgba(255, 255, 255, 0.15);
 }
 
 .properties-map-embed {
