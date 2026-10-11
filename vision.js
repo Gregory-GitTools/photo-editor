@@ -105,3 +105,20 @@ function detectLines(scaledCanvas) {
 
   return { horizonAngle: chosen ? chosen.angle : 0, confident: !!chosen };
 }
+
+// Шумоподавление через OpenCV.js (bilateralFilter, см. NOISE_VARIANTS в app.js — почему не
+// fastNlMeansDenoisingColored), мутирует canvas на месте — как и цветокоррекция
+// (imaging.js/applyColorTreatment), это единственная точка применения эффекта, общая для
+// превью и итогового экспорта. variant.d === 0 ("Выкл") — осознанный no-op, ничего не
+// читаем/не пишем, как "Оригинал" у COLOR_VARIANTS.
+function denoiseCanvas(canvas, variant) {
+  if (!variant || !variant.d || !window.cv || !Vision.ready) return;
+  const src = cv.imread(canvas);
+  const rgb = new cv.Mat();
+  cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
+  const dst = new cv.Mat();
+  cv.bilateralFilter(rgb, dst, variant.d, variant.sigmaColor, variant.sigmaSpace, cv.BORDER_DEFAULT);
+  cv.cvtColor(dst, src, cv.COLOR_RGB2RGBA);
+  cv.imshow(canvas, src);
+  src.delete(); rgb.delete(); dst.delete();
+}

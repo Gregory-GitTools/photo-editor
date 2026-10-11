@@ -604,7 +604,8 @@ body.panel-right .thumb:has(> img.loaded) {
    обычные миниатюры), чтобы не путать с листанием фото. База уже даёт обычный flex-column на
    всю высоту ленты — нужно только отключить перенос в новый столбец (вариантов всего 4, но
    мало ли что) и подвинуть их к низу */
-body.panel-right #album-grid.color-picker-mode {
+body.panel-right #album-grid.color-picker-mode,
+body.panel-right #album-grid.denoise-picker-mode {
   flex-wrap: nowrap;
   justify-content: flex-end;
 }
@@ -875,6 +876,16 @@ body.panel-right #album-grid.color-picker-mode {
 .about-path-input:not(:disabled):focus {
   outline: none;
   border-color: var(--accent);
+}
+
+.about-path-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.about-path-actions .text-btn {
+  padding: 6px 12px;
+  font-size: 0.8rem;
 }
 
 .about-install-btn {

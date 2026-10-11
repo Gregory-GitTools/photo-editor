@@ -107,9 +107,10 @@
       <button id="perspective-btn" title="Коррекция перспективы" disabled><img src="icons/Коррекция перспективы WIT.png" alt=""></button>
       <button id="grid-btn" title="Сетка" disabled><img src="icons/Lattice WIT.png" alt=""></button>
       <button id="color-btn" title="Цветокоррекция" disabled><img src="icons/Palette WIT.png" alt=""></button>
+      <button id="denoise-btn" title="Шумоподавление" disabled><img src="icons/Sparkle WIT.png" alt=""></button>
       <button id="restore-btn" title="Восстановить оригинал" disabled><img src="icons/Back WIT.png" alt=""></button>
       <button id="star-btn" title="Добавить в альбом" disabled><img src="icons/Star WIT.png" alt=""></button>
-      <button id="save-btn" title="Сохранить в альбом" disabled><img src="icons/Save WIIT.png" alt=""></button>
+      <button id="save-btn" title="Сохранить в альбом" disabled><img src="icons/OK WIT.png" alt=""></button>
       <button id="delete-btn" title="Удалить (переместить в папку «Deleted» в корне альбома)" disabled><img src="icons/Delit WIT.png" alt=""></button>
       <button id="prev-btn" title="Предыдущее" disabled>◀</button>
       <button id="next-btn" title="Следующее" disabled>▶</button>
@@ -139,6 +140,14 @@
       Путь к папке альбомов
       <input type="text" id="root-path-input" class="about-path-input" placeholder="—" disabled>
     </label>
+    <div class="about-path-row" title="Отдельная папка для кураторских копий (звёздочка/сохранение) — например, на другом диске. Если не выбрать — такие копии складываются в папку «Alboms» в корне «Папки альбомов» выше. Оригиналы и «Deleted» эта настройка не затрагивает — они остаются в «Папке альбомов», как раньше.">
+      Папка для альбомов
+      <div class="about-path-input" id="albums-root-status">по умолчанию — «Alboms» в корне «Папки альбомов»</div>
+      <div class="about-path-actions">
+        <button id="albums-root-pick-btn" class="text-btn">Выбрать…</button>
+        <button id="albums-root-forget-btn" class="text-btn" hidden>Сбросить</button>
+      </div>
+    </div>
     <button id="install-btn" class="text-btn about-install-btn" title="Установить на рабочий стол" disabled>
       <img src="icons/icon-32.png" alt="">
       Установить на рабочий стол

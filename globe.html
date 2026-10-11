@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <title>Глобус альбомов — Albom</title>
 <link rel="icon" href="icons/Globe WIT.png">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
   html, body, #globeViz { margin: 0; height: 100%; background: #000; overflow: hidden; }
   body { position: relative; }
@@ -76,44 +75,28 @@
   }
 
   /* карта фото открытого альбома — второй полноэкранный слой поверх глобуса, см.
-     enterAlbumMode()/exitAlbumMode() ниже; видна вместо глобуса, не поверх него */
+     enterAlbumMode()/exitAlbumMode() ниже; видна вместо глобуса, не поверх него.
+     Сам Leaflet больше не живёт здесь — карта нырка это тот же map.html, что и у кнопки
+     внешней карты, встроенный сюда через iframe (Григорий: "Карту нужно брать ту, что на
+     кнопке внешней карты сразу" — раньше здесь была отдельная, разошедшаяся копия Leaflet). */
   #album-map-frame { position: absolute; inset: 0; z-index: 2; background: #1b1b1f; transition: opacity 0.35s ease; }
-  #album-map-frame-inner { position: absolute; inset: 0; }
+  #album-map-iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: none; }
   #album-back-btn {
     position: absolute; left: 12px; top: 12px; z-index: 1000;
     background: rgba(27, 27, 31, 0.85); color: #e8e8ec; border: 1px solid rgba(255, 255, 255, 0.25);
     font: 600 0.85rem system-ui, sans-serif; padding: 6px 12px; border-radius: 6px; cursor: pointer;
   }
-
-  /* капля с числом кадров на карте фото альбома — верстка скопирована 1:1 из map.html
-     (см. Часть 3 плана слияния глобуса и карты), другое имя-контейнер (#album-map-frame
-     вместо #globeViz) не даёт этим правилам столкнуться с версткой капель самого глобуса
-     выше — обе стороны используют одни и те же имена классов (geo-pin-wrap/geo-pin) */
-  #album-map-frame .geo-pin-icon { background: transparent; border: none; }
-  #album-map-frame .geo-pin-wrap { display: flex; flex-direction: column; align-items: center; pointer-events: none; }
-  #album-map-frame .geo-pin {
-    width: 22px; height: 22px; border-radius: 50% 50% 50% 0; background: #4a90d9;
-    border: 2px solid #fff; transform: rotate(-45deg); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
-  }
-  #album-map-frame .geo-pin-num {
-    margin-top: 2px; font: 600 11px/1 system-ui, sans-serif; color: #fff;
-    background: rgba(27, 27, 31, 0.75); border-radius: 3px; padding: 1px 4px;
-  }
-  #album-map-frame .geo-pin-wrap.active .geo-pin { background: #ffb400; width: 28px; height: 28px; }
-  #album-map-frame .geo-pin-wrap.active .geo-pin-num { background: #ffb400; color: #1b1b1f; font-weight: 700; }
 </style>
 </head>
 <body>
 <div id="globeViz"></div>
 <div id="cloudOverlay" class="hidden"></div>
 <div id="album-map-frame" class="layer-off">
-  <div id="album-map-frame-inner"></div>
+  <iframe id="album-map-iframe" src="map.html"></iframe>
   <button id="album-back-btn" type="button">← Глобус</button>
 </div>
 <script src="https://unpkg.com/globe.gl"></script>
 <script src="https://unpkg.com/topojson-client@3"></script>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="geo-markers.js"></script>
 <script>
   let albums = []; // [{index, name, lat, lon}, ...] — по одному на готовый альбом
   let activeIndex = -1; // index (см. albums) альбома, открытого сейчас в главном окне — его каплю подсвечиваем
@@ -131,43 +114,32 @@
   let currentAlbumIndex = -1;
   let photoPoints = []; // State.albumGeo из app.js — координаты фото ТЕКУЩЕГО открытого альбома
   let photoActiveIndex = -1;
-  let albumMap = null; // Leaflet-карта фото альбома, создаётся один раз при первом входе
-  const albumMarkersRef = { list: [] };
-  let lastPhotoFocusKey = null;
-  let lastPhotoPointsSignature = null;
-  // Сразу после входа карта должна показать альбом целиком (fitBounds), а не прыгать на
-  // activeIndex, который к первому рендеру уже пришёл от главного окна — см.
-  // renderAlbumMap() ниже. Сбрасывается в false при каждом входе (enterAlbumMode).
+  // Карта фото альбома — не отдельная Leaflet-копия, а тот же map.html, что и у кнопки
+  // внешней карты, встроенный сюда через iframe (см. sendToAlbumIframe/message-listener ниже).
+  const albumMapIframe = document.getElementById("album-map-iframe");
+  let albumMapIframeReady = false;
+  // Сразу после входа карта должна показать альбом целиком (fitBounds внутри map.html), а не
+  // прыгать на activeIndex, который к первому рендеру уже пришёл от главного окна — см.
+  // sendToAlbumIframe() ниже. Сбрасывается в false при каждом входе (enterAlbumMode).
   let albumViewInitialized = false;
   // activeIndex, с которым мы вошли в альбом — пока пользователь его не сменил (не
   // перешёл к другому фото), продолжаем показывать альбом целиком, наращивая охват по
-  // мере того как приходят новые геоточки асинхронного скана (см. renderAlbumMap)
+  // мере того как приходят новые геоточки асинхронного скана (см. sendToAlbumIframe)
   let albumEntryActiveIndex = null;
   // Зум выхода — Григорий явно попросил выход отдалением колесом, симметрично входу на
-  // глобусе (см. onAlbumMapZoomEnd ниже). albumBaselineZoom — зум последнего вида, который
-  // МЫ САМИ выставили программно (весь альбом целиком либо конкретное сфокусированное фото).
-  // Выставляется СИНХРОННО прямо в момент вызова fitBounds/setView (через getBoundsZoom() —
-  // тот же расчёт, что fitBounds делает внутри себя, но без ожидания анимации), а НЕ по
-  // событию zoomend: при animate:true Leaflet обновляет getZoom() только ПОСЛЕ завершения
-  // анимации (проверено эмпирически) — ожидание zoomend для фиксации опорного уровня
-  // оставляло окно, в которое мог влезть настоящий зум-жест пользователя и получить
-  // неверно приписанный опорный зум. Раньше это решалось флагом albumProgrammaticZoom +
-  // подстраховочным таймером, но флаг лишь ОТКЛАДЫВАЛ проблему — окно гонки оставалось,
-  // просто более узким; синхронный расчёт закрывает её полностью.
+  // глобусе. albumBaselineZoom — зум последнего вида, который map.html САМ выставил
+  // программно (весь альбом целиком либо конкретное сфокусированное фото), приходит сюда
+  // сообщением "map-baseline-zoom" (см. map.html — выставляется синхронно через
+  // getBoundsZoom()/фиксированное число, ДО самого fitBounds/setView, а не по zoomend).
   let albumBaselineZoom = null;
   // Короткая блокировка зума колесом сразу после входа/нырка в альбом — Григорий пожаловался,
   // что при входе продолжаешь крутить колесо по инерции ровно в момент подмены слоя, и это же
   // движение колеса тут же зумит уже саму карту ("долго крутишь колесо и потом очень резко
   // влетаешь на карту... пролетаешь и упираешься в карту"). Пауза даёт глазу время увидеть
-  // карту до того, как колесо снова начнёт её зумить.
-  let albumZoomCooldownTimer = null;
+  // карту до того, как колесо снова начнёт её зумить. Сама пауза (scrollWheelZoom.disable/
+  // enable) теперь живёт внутри map.html (см. его обработчик "pause-zoom") — здесь остаётся
+  // только константа и сама отправка сообщения в enterAlbumMode().
   const ALBUM_ZOOM_COOLDOWN_MS = 450;
-  function pauseAlbumMapZoom() {
-    const m = ensureAlbumMap();
-    m.scrollWheelZoom.disable();
-    clearTimeout(albumZoomCooldownTimer);
-    albumZoomCooldownTimer = setTimeout(() => m.scrollWheelZoom.enable(), ALBUM_ZOOM_COOLDOWN_MS);
-  }
 
   // Инициализация — один в один с travel-globe/app.js: локальная 8k-текстура Земли вместо
   // дефолтной низкодетальной из three-globe, анизотропная фильтрация после асинхронной
@@ -536,7 +508,7 @@
   // "без фокуса"), обработчик "globe-entered-album" успевал вызвать refreshMaps() и
   // прислать сюда activeIndex:-1 РАНЬШЕ, чем openAlbum() успевал выставить настоящий
   // индекс — albumEntryActiveIndex защёлкивался на -1, и первый же реальный activeIndex
-  // (0) ошибочно засчитывался за "пользователь сам сменил фото" (см. renderAlbumMap),
+  // (0) ошибочно засчитывался за "пользователь сам сменил фото" (см. sendToAlbumIframe),
   // альбом целиком (fitBounds/albumBaselineZoom) так и не показывался, и зум-выход
   // переставал работать насовсем до следующего входа. Теперь оба действия идут ОДНИМ
   // сообщением — app.js обязан сначала дождаться openAlbum(), и только потом включить
@@ -553,14 +525,15 @@
     albumEntryActiveIndex = null;
     albumBaselineZoom = null;
     crossfade(document.getElementById("globeViz"), document.getElementById("album-map-frame"), () => {
-      ensureAlbumMap();
-      pauseAlbumMapZoom();
-      requestAnimationFrame(() => albumMap.invalidateSize());
+      if (albumMapIframeReady) {
+        albumMapIframe.contentWindow.postMessage({ type: "pause-zoom", ms: ALBUM_ZOOM_COOLDOWN_MS }, "*");
+        sendToAlbumIframe();
+      }
     });
   }
 
   // выход — либо кнопкой "← Глобус" (гарантированный запасной путь, никогда не запирает
-  // пользователя), либо отдалением колесом на самой карте (см. onAlbumMapZoomEnd ниже —
+  // пользователя), либо отдалением колесом на самой карте (см. "map-zoom" в message-listener —
   // Григорий явно попросил зум-выход симметрично зум-входу на глобусе, взамен более раннего
   // варианта "только кнопка", портированного из travel-globe и оказавшегося недостаточным
   // на живой проверке).
@@ -580,8 +553,6 @@
     setTargetedAlbum(-1);
     photoPoints = [];
     photoActiveIndex = -1;
-    lastPhotoFocusKey = null;
-    lastPhotoPointsSignature = null;
     albumViewInitialized = false;
     albumEntryActiveIndex = null;
     albumBaselineZoom = null;
@@ -608,110 +579,75 @@
   // позже". Было 2 — увеличено, чтобы требовался заметно больший отход колесом от опорного
   // вида, прежде чем это засчитается за жест выхода.
   const EXIT_ZOOM_MARGIN = 4;
-  function onAlbumMapZoomEnd() {
-    if (!albumMode || albumBaselineZoom === null) return;
-    // раньше при близком соседнем альбоме тут был автоматический "нырок" сразу в него,
-    // минуя глобус — Григорий забраковал на живой проверке: переход происходил не туда,
-    // куда он целился, ощущался навязчивым и дезориентирующим ("перескакивание по
-    // порядку"). Выход теперь всегда один и тот же — обратно на глобус; чтобы долететь до
-    // другого альбома, Григорий явно предпочитает сам кликнуть по нему на глобусе, а не
-    // чтобы это решали за него.
-    if (albumMap.getZoom() <= albumBaselineZoom - EXIT_ZOOM_MARGIN) exitAlbumMode();
-  }
 
-  // инициализация Leaflet-карты фото альбома — порядок в точности как в map.html:
-  // L.map() → tileLayer().addTo() → setView() ДО расстановки маркеров, иначе Leaflet считает
-  // размеры по ещё скрытому контейнеру и все капли потом съезжают
-  function ensureAlbumMap() {
-    if (albumMap) return albumMap;
-    albumMap = L.map("album-map-frame-inner", { attributionControl: true });
-    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-      attribution: "© OpenStreetMap",
-    }).addTo(albumMap);
-    albumMap.setView([20, 0], 2);
-    albumMap.on("zoomend", onAlbumMapZoomEnd);
-    return albumMap;
-  }
-
-  function photoPointsSignature(pts) {
-    return pts.map((p) => (p ? p.lat.toFixed(6) + "," + p.lon.toFixed(6) : "")).join(";");
-  }
-
-  // рендер карты фото альбома — по мотивам render() в map.html, с одним отличием: пока
-  // пользователь ещё не перешёл к другому фото (не сменил activeIndex относительно того,
-  // с которым мы вошли в альбом), карта всегда показывает альбом целиком (fitBounds), а не
-  // прыгает на activeIndex. Взводить этот режим "готово" на первой найденной точке
-  // ОШИБКА — geo-скан альбома в app.js асинхронный и прогрессивный (collectAlbumGeo шлёт
-  // refreshMaps() по мере нахождения каждого фото по отдельности): при таком взводе
-  // единственная первая найденная точка "запирала" карту на zoom 14 одного фото ещё до
-  // того, как остальные точки альбома успевали прийти (жалоба Григория "вход на одну
-  // точку" после живой проверки). Поэтому вместо триггера "точки появились" — триггер
-  // "пользователь сам сменил фото": пока activeIndex не отличается от того, с которым мы
-  // вошли, каждый рендер просто расширяет fitBounds на все точки, что успели прийти к
-  // этому моменту. По духу портировано с travel-globe/app.js#goToMapAt (там то же самое
-  // решается через bounds при отсутствии конкретного highlightIndex).
-  function renderAlbumMap() {
-    if (!albumMode) return;
-    const m = ensureAlbumMap();
-    syncGeoMarkers(L, m, albumMarkersRef, photoPoints, photoActiveIndex, (indexes) => {
-      if (window.opener && !window.opener.closed) {
-        window.opener.postMessage({ focusIndex: pickClusterTarget(indexes, photoActiveIndex) }, "*");
-      }
-    });
-    if (albumEntryActiveIndex === null) albumEntryActiveIndex = photoActiveIndex;
-    if (!albumViewInitialized && photoActiveIndex !== albumEntryActiveIndex) {
+  // Отправка текущих геоданных альбома в карту нырка (map.html-iframe) — вместо прежней
+  // собственной Leaflet-копии (renderAlbumMap). "Показывать альбом целиком, пока пользователь
+  // сам не сменил фото" реализовано через саму отправляемую точку фокуса: effectiveIndex
+  // остаётся -1 (нет фокуса), пока activeIndex не отличается от того, с которым мы вошли в
+  // альбом — map.html внутри уже умеет считать fitBounds по всем точкам при activeIndex===-1,
+  // отдельной логики тут дублировать не нужно. Прогрессивный асинхронный скан геоданных
+  // (collectAlbumGeo в app.js шлёт данные по мере нахождения каждого фото) при этом просто
+  // раз за разом досылает более полный набор points — map.html сам расширит fitBounds.
+  function sendToAlbumIframe() {
+    if (!albumMode || !albumMapIframeReady) return;
+    // Сюда попадают и локальный "пустой" вызов сразу при входе (photoPoints ещё [] — данные
+    // от opener'а физически не успели дойти), и настоящие сообщения с реальными точками —
+    // защёлкивать albumEntryActiveIndex нужно только на настоящих данных, иначе пустой
+    // локальный вызов первым зафиксирует activeIndex:-1, а пришедший следом настоящий
+    // activeIndex:0 ошибочно засчитается за "пользователь сам сменил фото"
+    if (albumEntryActiveIndex === null && photoPoints.length > 0) albumEntryActiveIndex = photoActiveIndex;
+    if (albumEntryActiveIndex !== null && !albumViewInitialized && photoActiveIndex !== albumEntryActiveIndex) {
       albumViewInitialized = true; // пользователь сам перешёл к другому фото — дальше обычная логика фокуса
     }
-    const known = photoPoints.filter(Boolean);
-    if (!albumViewInitialized) {
-      // Григорий: "при открытии карты не хватает плавности" — этот самый первый показ
-      // альбома целиком раньше ставился мгновенным animate:false, из-за чего карта буквально
-      // телепортировалась в кадр альбома сразу же, как только проступала из-под кроссфейда.
-      // Тут включаем настоящую анимацию Leaflet. albumBaselineZoom считаем через
-      // getBoundsZoom() ДО вызова fitBounds — тот же расчёт, что fitBounds сделает внутри
-      // себя, но синхронно и сразу, не дожидаясь конца анимации (см. комментарий у
-      // объявления albumBaselineZoom выше, почему НЕ через zoomend).
-      if (known.length > 1) {
-        const bounds = L.latLngBounds(known.map((p) => [p.lat, p.lon])).pad(0.2);
-        albumBaselineZoom = m.getBoundsZoom(bounds);
-        m.fitBounds(bounds, { animate: true });
-      } else if (known.length === 1) {
-        albumBaselineZoom = 14;
-        m.setView([known[0].lat, known[0].lon], 14, { animate: true });
-      }
-      const cur0 = photoPoints[photoActiveIndex];
-      lastPhotoFocusKey = cur0 ? `${photoActiveIndex}:${cur0.lat.toFixed(6)},${cur0.lon.toFixed(6)}` : `none:${photoActiveIndex}`;
-      lastPhotoPointsSignature = photoPointsSignature(photoPoints);
-      requestAnimationFrame(() => m.invalidateSize());
-      return;
-    }
-    const cur = photoPoints[photoActiveIndex];
-    const focusKey = cur ? `${photoActiveIndex}:${cur.lat.toFixed(6)},${cur.lon.toFixed(6)}` : `none:${photoActiveIndex}`;
-    if (focusKey !== lastPhotoFocusKey) {
-      lastPhotoFocusKey = focusKey;
-      if (cur) {
-        albumBaselineZoom = 16;
-        m.setView([cur.lat, cur.lon], 16, { animate: false });
-      }
-    }
-    const sig = photoPointsSignature(photoPoints);
-    if (sig !== lastPhotoPointsSignature) {
-      lastPhotoPointsSignature = sig;
-      if (!cur && known.length) {
-        const bounds = L.latLngBounds(known.map((p) => [p.lat, p.lon])).pad(0.2);
-        albumBaselineZoom = m.getBoundsZoom(bounds);
-        m.fitBounds(bounds, { animate: false });
-      }
-    }
-    requestAnimationFrame(() => m.invalidateSize());
+    const effectiveIndex = albumViewInitialized ? photoActiveIndex : -1;
+    albumMapIframe.contentWindow.postMessage({ points: photoPoints, activeIndex: effectiveIndex, copyMode: false }, "*");
   }
 
   document.getElementById("album-back-btn").addEventListener("click", exitAlbumMode);
 
   window.addEventListener("message", (e) => {
+    // сообщения от встроенной карты нырка (map.html-iframe) — отдельная ветка, проверяется
+    // до источника opener'а ниже, т.к. это другой source
+    if (e.source === albumMapIframe.contentWindow) {
+      const data = e.data || {};
+      if (data.type === "map-ready") {
+        // map.html — лёгкая страница и может прислать это раньше, чем здесь успеет
+        // зарегистрироваться этот же listener (globe.html тяжелее — грузит globe.gl,
+        // текстуры и т.д.), поэтому map.html шлёт "map-ready" повторно, пока не получит ack
+        albumMapIframeReady = true;
+        albumMapIframe.contentWindow.postMessage({ type: "map-ready-ack" }, "*");
+        sendToAlbumIframe();
+        return;
+      }
+      if (typeof data.focusIndex === "number") {
+        if (window.opener && !window.opener.closed) {
+          window.opener.postMessage({ focusIndex: data.focusIndex }, "*");
+        }
+        return;
+      }
+      if (data.type === "map-baseline-zoom") { albumBaselineZoom = data.zoom; return; }
+      if (data.type === "map-zoom") {
+        // раньше при близком соседнем альбоме тут был автоматический "нырок" сразу в него,
+        // минуя глобус — Григорий забраковал на живой проверке: переход происходил не туда,
+        // куда он целился, ощущался навязчивым и дезориентирующим ("перескакивание по
+        // порядку"). Выход теперь всегда один и тот же — обратно на глобус.
+        if (albumMode && albumBaselineZoom !== null && data.zoom <= albumBaselineZoom - EXIT_ZOOM_MARGIN) exitAlbumMode();
+        return;
+      }
+      return;
+    }
     if (e.source !== window.opener) return;
     const data = e.data || {};
+    // главное окно открыло карту в отдельном окне — она дублирует карту альбома, уже
+    // видную здесь при нырке, поэтому возвращаемся к обзору глобуса (см. app.js)
+    if (data.type === "exit-album-mode") { exitAlbumMode(); return; }
+    // кнопка внешней карты в главном окне запросила показ карты альбома тем же путём, что и
+    // нырок жестом зума — единый вход означает единый, предсказуемый выход независимо от того,
+    // как был запущен показ (см. app.js, toggleLocationMapWindow)
+    if (data.type === "enter-album-mode") {
+      enterAlbumMode(typeof data.albumIndex === "number" ? data.albumIndex : -1);
+      return;
+    }
     if (Array.isArray(data.albums)) {
       albums = data.albums;
       activeIndex = typeof data.activeIndex === "number" ? data.activeIndex : -1;
@@ -721,7 +657,7 @@
     if (Array.isArray(data.points)) {
       photoPoints = data.points;
       photoActiveIndex = typeof data.activeIndex === "number" ? data.activeIndex : -1;
-      renderAlbumMap();
+      sendToAlbumIframe();
     }
   });
 

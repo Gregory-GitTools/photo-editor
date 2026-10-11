@@ -43,6 +43,16 @@
   let copyMode = false; // режим редактирования параметров в главном окне — без него клик по фону карты ничего не делает
   let lastPointsSignature = null; // общий обзор пересчитываем только когда меняется сам набор точек, не каждый рендер
   let lastFocusKey = null; // и подводим вид к капле только когда реально сменилось сфокусированное фото, а не при каждом обновлении (например, фоновом досканировании GPS остальных фото альбома)
+  let pauseZoomTimer = null;
+  let userAdjustedOverview = false; // как только пользователь сам покрутил зум/пан общего обзора — больше не дёргаем вид автоматическим fitBounds при приходе новых точек фонового скана, иначе гистерезис выхода никогда не срабатывает (см. Bug 4)
+  let lastAutoFitZoom = null; // зум, который только что выставили программно сами — чтобы отличить его zoomend от настоящего жеста пользователя
+
+  // Хост — либо opener (обычное всплывающее окно кнопки внешней карты), либо parent (эта же
+  // страница вставлена как iframe внутрь globe.html — карта нырка переиспользует эту же карту).
+  const host = window.opener || (window.parent !== window ? window.parent : null);
+  function sendToHost(msg) {
+    if (host && !host.closed) host.postMessage(msg, "*");
+  }
 
   function ensureMap() {
     if (map) return map;
@@ -52,13 +62,26 @@
       attribution: "© OpenStreetMap",
     }).addTo(map);
     map.setView([20, 0], 2);
+    lastAutoFitZoom = 2;
     map.on("click", (e) => {
       if (!copyMode) return; // ставим точку только когда в главном окне включён карандаш
       // сами метку не ставим — авторитетные данные живут в основном окне; оно пришлёт
       // обратно обновлённый набор точек через postMessage, и мы просто перерисуемся
-      if (window.opener && !window.opener.closed) {
-        window.opener.postMessage({ lat: e.latlng.lat, lon: e.latlng.lng }, "*");
+      sendToHost({ lat: e.latlng.lat, lon: e.latlng.lng });
+    });
+    // Зум колесом на этой же карте, когда она встроена в globe.html — сигнал для решения
+    // о выходе из режима альбома (см. globe.html, ветка "map-zoom"). Для обычного
+    // всплывающего окна карты это no-op — app.js такое сообщение не слушает.
+    map.on("zoomend", () => {
+      const z = map.getZoom();
+      sendToHost({ type: "map-zoom", zoom: z });
+      // если это результат нашего же программного fitBounds/setView — не считаем жестом
+      // пользователя; иначе это настоящий ручной зум, дальше не даём авто-обзору его затирать
+      if (lastAutoFitZoom !== null && z === lastAutoFitZoom) {
+        lastAutoFitZoom = null;
+        return;
       }
+      userAdjustedOverview = true;
     });
     return map;
   }
@@ -76,21 +99,35 @@
   function render() {
     const m = ensureMap();
     syncGeoMarkers(L, m, markersRef, points, activeIndex, (indexes) => {
-      if (window.opener && !window.opener.closed) {
-        window.opener.postMessage({ focusIndex: pickClusterTarget(indexes, activeIndex) }, "*");
-      }
+      sendToHost({ focusIndex: pickClusterTarget(indexes, activeIndex) });
     });
     const cur = points[activeIndex];
     const focusKey = cur ? `${activeIndex}:${cur.lat.toFixed(6)},${cur.lon.toFixed(6)}` : `none:${activeIndex}`;
     if (focusKey !== lastFocusKey) {
       lastFocusKey = focusKey;
-      if (cur) m.setView([cur.lat, cur.lon], 16);
+      // Григорий: "при постановке фокуса на фото или любом месте не дёргать карту ни зумом
+      // ни позиционированием" — раньше тут был m.setView([cur.lat, cur.lon], 16), сейчас камеру
+      // не трогаем вообще, пользователь сам решает, куда смотреть. Но опорный зум для гистерезиса
+      // зум-выхода из альбома (albumBaselineZoom в globe.html/State.mapBaselineZoom в app.js) всё
+      // равно обязан обновляться — иначе он застынет на значении времени входа, и выход зумом
+      // будет либо срабатывать слишком рано, либо слишком поздно относительно того вида, что
+      // пользователь реально видит перед собой прямо сейчас
+      if (cur) sendToHost({ type: "map-baseline-zoom", zoom: m.getZoom() });
     }
     const known = points.filter(Boolean);
+    // ни одной известной точки — это всегда свежий вход в альбом (см. State.albumGeo, заполняется
+    // null'ами при открытии), а не пользователь стёр все геометки. Пользуемся этим как сигналом
+    // "начинаем сессию обзора заново" и снимаем блокировку авто-fitBounds ниже
+    if (known.length === 0) userAdjustedOverview = false;
     const sig = pointsSignature(points);
     if (sig !== lastPointsSignature) {
       lastPointsSignature = sig;
-      if (!cur && known.length) m.fitBounds(L.latLngBounds(known.map((p) => [p.lat, p.lon])).pad(0.2));
+      if (!cur && known.length && !userAdjustedOverview) {
+        const bounds = L.latLngBounds(known.map((p) => [p.lat, p.lon])).pad(0.2);
+        sendToHost({ type: "map-baseline-zoom", zoom: m.getBoundsZoom(bounds) });
+        lastAutoFitZoom = m.getBoundsZoom(bounds);
+        m.fitBounds(bounds);
+      }
     }
     document.getElementById("hint").hidden = !copyMode || !!cur;
     document.title = cur ? `Место съёмки (${cur.lat.toFixed(5)}, ${cur.lon.toFixed(5)}) — Albom` : "Место съёмки — Albom";
@@ -100,8 +137,19 @@
   ensureMap();
 
   window.addEventListener("message", (e) => {
-    if (e.source !== window.opener) return;
+    if (e.source !== host) return;
     const data = e.data || {};
+    if (data.type === "map-ready-ack") {
+      clearInterval(mapReadyTimer);
+      return;
+    }
+    if (data.type === "pause-zoom") {
+      const m = ensureMap();
+      m.scrollWheelZoom.disable();
+      clearTimeout(pauseZoomTimer);
+      pauseZoomTimer = setTimeout(() => m.scrollWheelZoom.enable(), data.ms || 450);
+      return;
+    }
     if (!Array.isArray(data.points)) return;
     points = data.points;
     activeIndex = data.activeIndex;
@@ -109,11 +157,11 @@
     render();
   });
 
-  // сигнализируем главному окну, что можно присылать данные — открытие окна и первое
-  // postMessage от opener'а иначе могут обогнать подписку на "message" здесь
-  if (window.opener && !window.opener.closed) {
-    window.opener.postMessage({ type: "map-ready" }, "*");
-  }
+  // сигнализируем хосту, что можно присылать данные. Хост (globe.html) тяжелее этой
+  // страницы (грузит globe.gl, текстуры и т.д.) и может ещё не успеть подписаться на
+  // "message" к моменту первой отправки — поэтому шлём повторно, пока не придёт ack
+  const mapReadyTimer = setInterval(() => sendToHost({ type: "map-ready" }), 200);
+  sendToHost({ type: "map-ready" });
 </script>
 </body>
 </html>

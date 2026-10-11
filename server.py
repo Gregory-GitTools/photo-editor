@@ -10,7 +10,6 @@ import http.server
 import json
 import os
 import re
-import socketserver
 import subprocess
 import sys
 import threading
@@ -183,6 +182,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+    # ThreadingHTTPServer, а не однопоточный TCPServer — страница при загрузке
+    # запрашивает app.js и десяток иконок почти одновременно; однопоточный сервер
+    # часть таких параллельных подключений сбрасывал (ERR_CONNECTION_REFUSED),
+    # иногда роняя даже сам app.js, а не только иконки
+    with http.server.ThreadingHTTPServer(("", PORT), Handler) as httpd:
         print(f"Albom: http://localhost:{PORT}/")
         httpd.serve_forever()

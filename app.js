@@ -22,6 +22,16 @@ const AUTO_HORIZON_MAX_ANGLE = 5;
 const ORIGINALS_DIR = "[Originals]";
 const ALBUM_SUFFIX = "-Albom";
 const DELETED_DIR = "Deleted"; // общая для всего альбома корзина, лежит в State.rootHandle (не в каждой подпапке)
+// дефолтный контейнер для кураторских альбомов, когда в настройках не задана внешняя «Папка
+// для альбомов» (Григорий, 2026-10-11: «если папка с альбомами не задана, то создаём в корне
+// папку Alboms») — живёт прямо в State.rootHandle, оригиналы и Deleted не трогает
+const ALBOMS_ROOT_DIR = "Alboms";
+// файл-маркер внутри кураторской папки хранит исходное имя трипа, для которого её создали —
+// без него простое совпадение имени папки теряет альбом, если его потом переименуют в «Папке
+// альбомов» (Григорий: «эти папки будут переименовываться»). Расширение не .txt/.md
+// специально: такие файлы прямо в папке альбома Travel Earth читает как текст экскурсии
+// (см. readExcursion в travel-earth/app.js) — маркер не должен туда попасть и испортить текст
+const ALBUM_MARKER_FILE = ".photo-editor-album.json";
 
 const COLOR_VARIANTS = [
   { key: "original", label: "Оригинал", clipPercent: 0, saturationBoost: 1, warm: 0 },
@@ -29,6 +39,19 @@ const COLOR_VARIANTS = [
   { key: "contrast", label: "Контраст+", clipPercent: 0.02, saturationBoost: 1.15, warm: 0 },
   { key: "bw", label: "Ч/Б", clipPercent: 0.005, saturationBoost: 0, warm: 0 },
   { key: "warm", label: "Тепло", clipPercent: 0.005, saturationBoost: 1.15, warm: 12 },
+];
+
+// параметры OpenCV.js bilateralFilter (см. denoiseCanvas, vision.js) — d/sigmaColor/sigmaSpace.
+// fastNlMeansDenoisingColored (изначальный выбор) отсутствует в готовой сборке opencv.js с
+// docs.opencv.org — она собрана без модуля photo (проверено: cv.fastNlMeansDenoisingColored
+// не функция в реальном рантайме), поэтому шумоподавление сделано через edge-preserving
+// bilateralFilter из imgproc, который в этой сборке есть. "off" (d:0) — явный no-op,
+// как "Оригинал" у COLOR_VARIANTS.
+const NOISE_VARIANTS = [
+  { key: "off", label: "Выкл", d: 0, sigmaColor: 0, sigmaSpace: 0 },
+  { key: "light", label: "Лёгкое", d: 5, sigmaColor: 40, sigmaSpace: 40 },
+  { key: "medium", label: "Среднее", d: 9, sigmaColor: 75, sigmaSpace: 75 },
+  { key: "strong", label: "Сильное", d: 15, sigmaColor: 120, sigmaSpace: 120 },
 ];
 
 const el = (id) => document.getElementById(id);
@@ -48,7 +71,8 @@ const State = {
   originalsHandle: null, // создаётся лениво, только при первом сохранении
   curatedHandle: null, // папка "<альбом>-Albom" — создаётся лениво при первой звёздочке/сохранении
   deletedHandle: null, // папка DELETED_DIR в «Папке альбомов» (State.rootHandle) — создаётся лениво при первом удалении
-  curatedDirName: null, // реальное имя этой папки на диске (см. scanFiles — переживает переименование родителя)
+  curatedDirName: null, // реальное имя этой папки на диске (см. scanFiles/findCuratedFolder — переживает переименование и трипа, и самой папки, см. ALBUM_MARKER_FILE)
+  albumsRootHandle: null, // внешняя «Папка для альбомов» из настроек, если задана (см. ensureAlbumsRootHandle)
   queue: [], // [{name, handle, edited, starred, thumbUrl}]
   index: -1,
   fullBitmap: null,
@@ -81,11 +105,15 @@ const State = {
   perspectiveQuad: null, // [{x,y}×4] TL,TR,BR,BL в координатах preview-канваса
   colorVariant: COLOR_VARIANTS[1],
   colorPickerActive: false,
+  noiseVariant: NOISE_VARIANTS[0],
+  noisePickerActive: false,
   currentGeo: null, // {lat, lon} текущего фото — для кнопки "Открыть карту"
   currentExif: null, // разобранный EXIF текущего фото — чтобы вернуть камеру/GPS в файл при сохранении
   mapWindow: null, // ссылка на открытое окно карты, чтобы обновлять его при смене фото
   globeWindow: null, // ссылка на открытое окно глобуса (globe.html), см. mapWindow
   globeAlbumMode: false, // globeWindow сейчас показывает карту фото альбома (нырнули жестом зума), а не сам глобус — см. refreshMaps()
+  globeResumeAlbum: false, // globe.html только что открыт взамен закрытого mapWindow — надо сразу продолжить показывать тот же альбом (см. toggleGlobeWindow/"globe-ready")
+  mapBaselineZoom: null, // опорный зум отдельного окна карты (map.html вне глобуса) — та же логика зум-выхода, что и у карты внутри глобуса, см. MAP_EXIT_ZOOM_MARGIN
   previewZoom: 1, // масштаб превью в canvas-wrap, меняется колесом мыши
   copyMode: false, // режим редактирования параметров: кнопки копирования + редактируемые поля
   updateGpsRow: null, // колбэк, которым клик по карте обновляет отображение строки GPS
@@ -205,9 +233,16 @@ async function pickAlbum() {
     // необязательная удобная фича
   }
   await openAlbum(handle);
-  // приложение всегда открывается в режиме "Альбомы" — это не запоминаемая настройка, а
-  // фиксированный старт (см. project_photo_editor_albom_redesign, пункт 5)
-  if (!State.albumsViewActive) await toggleAlbumsView();
+  // режимы Альбомы/Проводник равнозначны (см. toggleAlbumsView/restoreViewModeAfterAlbumOpen) —
+  // тот же выбор режима, что и при автостарте, применяется и к свежевыбранной папке: последнее
+  // сохранённое предпочтение, кроме случая, когда в папке вовсе нет альбомов
+  let savedMode = null;
+  try {
+    savedMode = await idbGet("lastViewMode");
+  } catch (_) {
+    // необязательное удобство
+  }
+  await restoreViewModeAfterAlbumOpen(savedMode);
 }
 
 async function openAlbum(handle) {
@@ -268,7 +303,7 @@ function setPhotoControlsEnabled(enabled) {
   // "сохранить в альбом" — в общем списке: она не про наличие несохранённых правок, а просто
   // "отправить" текущее фото (оригинал или уже отредактированное) и его отметку "избранное" в
   // альбом, так что доступна всегда, пока вообще открыто какое-то фото
-  ["reset-btn", "star-btn", "prev-btn", "next-btn", "slideshow-btn", "fullscreen-btn", "rotate-slider", "rotate-toggle-btn", "auto-horizon-btn", "rotate-left-btn", "rotate-right-btn", "flip-btn", "grid-btn", "perspective-btn", "color-btn", "aspect-select", "properties-edit-btn", "save-btn", "delete-btn"].forEach((id) => {
+  ["reset-btn", "star-btn", "prev-btn", "next-btn", "slideshow-btn", "fullscreen-btn", "rotate-slider", "rotate-toggle-btn", "auto-horizon-btn", "rotate-left-btn", "rotate-right-btn", "flip-btn", "grid-btn", "perspective-btn", "color-btn", "denoise-btn", "aspect-select", "properties-edit-btn", "save-btn", "delete-btn"].forEach((id) => {
     el(id).disabled = !enabled;
   });
   // заставка с вращающимся лого — на пустом канвасе (ни одно фото ещё не открыто, либо
@@ -356,6 +391,18 @@ async function findAlbumFolders() {
     }
   }
   await walk(State.rootHandle, []);
+  // внешняя «Папка для альбомов» из настроек (см. ensureAlbumsRootHandle) — отдельный хендл
+  // своего showDirectoryPicker, не часть дерева State.rootHandle, обычный walk() выше её не
+  // увидит; сканируем так же, по суффиксу (дефолтный случай без внешней папки уже найден выше —
+  // "Alboms" в этом случае лежит прямо внутри State.rootHandle и walk() сам спускается в неё)
+  if (State.albumsRootHandle) {
+    try {
+      await walk(State.albumsRootHandle, [State.albumsRootHandle.name]);
+    } catch (_) {
+      // нет доступа (разрешение не выдано/отозвано) — молча пропускаем, альбомы из дефолтной
+      // "Alboms" (если есть) findAlbumFolders всё равно уже нашёл выше
+    }
+  }
   // порядок подчиняется тому же State.folderSortMode, что и обычное дерево папок (folder-sort-select)
   const mode = State.folderSortMode;
   if (mode === "date-desc" || mode === "date-asc") {
@@ -645,6 +692,28 @@ function folderNamePath(handle) {
   return names;
 }
 
+// File System Access API не гарантирует ===-равенство хендлов одной и той же папки на диске,
+// полученных из двух РАЗНЫХ обходов дерева (buildFolderTree и findAlbumFolders — независимые
+// обходы, каждый создаёт свои JS-объекты хендлов) — поэтому "тот же альбом" после пересборки
+// дерева можно узнать только по совпадению именного пути, а не по ссылке на хендл
+function samePath(a, b) {
+  return a.length === b.length && a.every((name, i) => name === b[i]);
+}
+
+// findAlbumFolders() не спускается внутрь уже найденной "-Albom" папки, но её собственные
+// подпапки (если есть) всё равно открываются кликом в списке "Альбомы" тем же обработчиком,
+// что и обычное дерево (см. createFolderNode) — из-за этого State.albumHandle может указывать
+// на подпапку ВНУТРИ альбома, а не на сам альбом. Всё, что сверяет текущий альбом со
+// State.albumsList (глобус, переход карта↔глобус), обязано сперва подняться сюда — иначе
+// найти совпадение по хендлу не получится
+function resolveAlbumListHandle(handle) {
+  let current = handle;
+  while (current && current !== State.rootHandle && !current.name.endsWith(ALBUM_SUFFIX)) {
+    current = State.folderParents.get(current);
+  }
+  return current && current !== State.rootHandle ? current : handle;
+}
+
 // File System Access API намеренно не отдаёт странице реальный путь папки на диске (это
 // решение безопасности браузера, а не забытая фича) — поэтому единственный способ открыть
 // Проводник на нужной папке это спросить у пользователя абсолютный путь к корню один раз
@@ -794,6 +863,25 @@ async function idbGet(key, store = IDB_STORE) {
 // при запуске пробуем открыть тот же альбом, что был в прошлый раз —
 // если браузер уже дал разрешение, читаем сразу без диалога; иначе показываем
 // кнопку "Продолжить: <папка>", так как повторный запрос доступа требует клика пользователя
+// режимы Альбомы/Проводник равнозначны (см. toggleAlbumsView) — при автостарте открываем тот
+// режим, что был активен перед последним закрытием, а не всегда Альбомы. Исключение: если в
+// папке вовсе нет альбомов ("-Albom" не найдено), список альбомов показать нечего — переходим
+// в Проводник независимо от сохранённого предпочтения (иначе пользователь упирается в пустой
+// список без единого способа попасть в обычное дерево папок)
+async function restoreViewModeAfterAlbumOpen(savedMode) {
+  const albums = await findAlbumFolders();
+  const wantAlbums = albums.length > 0 && savedMode !== "explorer";
+  if (wantAlbums !== State.albumsViewActive) {
+    await toggleAlbumsView();
+  } else if (!wantAlbums) {
+    // остаёмся в Проводнике без переключения режима (State.albumsViewActive и так уже false) —
+    // но дерево, которое openAlbum() уже построил, было построено МОЛЧА (см. buildFolderTree,
+    // {silent:true}) в расчёте на то, что toggleAlbumsView() вот-вот покажет его сам; раз
+    // переключения не будет, показываем дерево здесь явно, иначе оно навсегда останется невидимым
+    await showFolderTreeView();
+  }
+}
+
 async function tryRestoreLastAlbum() {
   let handle;
   try {
@@ -811,10 +899,22 @@ async function tryRestoreLastAlbum() {
   }
 
   if (perm === "granted") {
-    State.rootHandle = null;
-    await openAlbum(handle);
-    await restoreFocusInTree();
-    if (!State.albumsViewActive) await toggleAlbumsView();
+    try {
+      State.rootHandle = null;
+      await openAlbum(handle);
+      let savedMode = null;
+      try {
+        savedMode = await idbGet("lastViewMode");
+      } catch (_) {
+        // необязательное удобство
+      }
+      await restoreFocusInTree(savedMode !== "explorer");
+      await restoreViewModeAfterAlbumOpen(savedMode);
+    } catch (e) {
+      // открытие сохранённого альбома не должно молча ронять весь автостарт (пустой
+      // проводник, неактивные кнопки режима) — сообщаем и даём выбрать альбом заново
+      setStatus("status-bar", "Не удалось восстановить последний альбом: " + e.message);
+    }
     return;
   }
 
@@ -828,8 +928,14 @@ async function tryRestoreLastAlbum() {
         btn.hidden = true;
         State.rootHandle = null;
         await openAlbum(handle);
-        await restoreFocusInTree();
-        if (!State.albumsViewActive) await toggleAlbumsView();
+        let savedMode = null;
+        try {
+          savedMode = await idbGet("lastViewMode");
+        } catch (_) {
+          // необязательное удобство
+        }
+        await restoreFocusInTree(savedMode !== "explorer");
+        await restoreViewModeAfterAlbumOpen(savedMode);
       } else {
         setStatus("status-bar", "Доступ к папке не разрешён.");
       }
@@ -842,8 +948,17 @@ async function tryRestoreLastAlbum() {
 // дожидается построения дерева и раскрывает его вниз по сохранённому именному пути до
 // последнего открытого альбома — раскрытый путь даёт живой handle текущей сессии, поэтому
 // с ним можно и подсветить строку в дереве, и просто открыть альбом без отдельного
-// запроса разрешения (это уже живой потомок корня, разрешение которого только что получено)
-async function restoreFocusInTree() {
+// запроса разрешения (это уже живой потомок корня, разрешение которого только что получено).
+// forceAlbumLevel: true, если сессия восстанавливается в режим Альбомы (см. вызов в
+// tryRestoreLastAlbum) — там строки есть только для самих папок "-Albom", и без подъёма по
+// родителям openAlbum получил бы хендл подпапки, activeIndex у глобуса (см. refreshAlbumsGlobe)
+// не находил бы совпадения в State.albumsList, и ни строка в списке альбомов, ни метка на
+// глобусе не подсвечивались бы вовсе. А вот при восстановлении в режим Проводник (false) точный
+// сохранённый путь до подпапки внутри альбома нужно оставить как есть — раньше это поле всегда
+// стояло true в расчёте на то, что приложение при старте всегда переходит в Альбомы, и с
+// появлением сохранённого предпочтения режима это подтягивало фокус на весь альбом вместо
+// точной подпапки, если сессию закрыли в Проводнике
+async function restoreFocusInTree(forceAlbumLevel) {
   try {
     await State.treeBuildPromise;
   } catch (_) {
@@ -857,14 +972,22 @@ async function restoreFocusInTree() {
   }
   if (!path || path.length === 0) return;
 
-  const target = await expandTreeToPath(path);
-  if (!target || target === State.rootHandle) return;
+  try {
+    let target = await expandTreeToPath(path);
+    if (!target || target === State.rootHandle) return;
 
-  const row = State.folderRows.get(target);
-  // приложение только что открылось — строка ещё не была на экране, центрируем её в дереве
-  // (в отличие от обычного клика мышью, см. комментарий у highlightFolderRow)
-  if (row) highlightFolderRow(row, { center: true });
-  await openAlbum(target);
+    if (forceAlbumLevel) target = resolveAlbumListHandle(target);
+
+    const row = State.folderRows.get(target);
+    // приложение только что открылось — строка ещё не была на экране, центрируем её в дереве
+    // (в отличие от обычного клика мышью, см. комментарий у highlightFolderRow)
+    if (row) highlightFolderRow(row, { center: true });
+    await openAlbum(target);
+  } catch (_) {
+    // сохранённый путь мог устареть (подпапка переименована/удалена) — это не должно
+    // мешать tryRestoreLastAlbum перейти в режим Альбомы (иначе пустой проводник и
+    // неактивные кнопки режима, хотя разрешение на корень уже получено)
+  }
 }
 
 async function scanFiles() {
@@ -879,17 +1002,21 @@ async function scanFiles() {
   // сами фото в другом порядке не нужно (обсуждали и вернули как было)
   files.sort((a, b) => a.name.localeCompare(b.name));
 
-  // папку "-Albom" ищем не в открытой сейчас подпапке, а в папке альбома — прямом потомке
-  // «Папки альбомов», содержащем текущую открытую подпапку (см. resolveAlbumFolder) — иначе у
-  // альбома с камерами по разным подпапкам была бы своя "-Albom" на каждую подпапку; ищем по
-  // факту наличия суффикса, а не по совпадению с именем родителя — если саму папку альбома
-  // переименовали в проводнике, подпапка сохранит старое имя
-  const curatedParent = resolveAlbumFolder(State.albumHandle);
-  let curatedDirName = null;
-  for await (const entry of curatedParent.values()) {
-    if (entry.kind === "directory" && entry.name.endsWith(ALBUM_SUFFIX)) { curatedDirName = entry.name; break; }
+  // папку "-Albom" ищем не в открытой сейчас подпапке, а в «Папке для альбомов» (отдельном
+  // контейнере кураторских копий, см. ensureAlbumsRootHandle) — по трипу-предку текущей открытой
+  // подпапки (resolveAlbumFolder), а не по совпадению имени: если саму кураторскую папку
+  // переименовали, её узнают по файлу-маркеру (см. findCuratedFolder/ALBUM_MARKER_FILE)
+  const tripHandle = resolveAlbumFolder(State.albumHandle);
+  const albomsRootForScan = await peekAlbumsRootHandle();
+  let existingCurated = null;
+  if (albomsRootForScan) {
+    try {
+      existingCurated = await findCuratedFolder(albomsRootForScan, tripHandle.name);
+    } catch (_) {
+      // нет доступа к внешней папке в этот раз — просто не покажем "звёздочки" этого альбома
+    }
   }
-  State.curatedDirName = curatedDirName;
+  State.curatedDirName = existingCurated ? existingCurated.name : null;
 
   let originalsHandle = null;
   const backupNames = new Set();
@@ -903,10 +1030,9 @@ async function scanFiles() {
   }
 
   const curatedNames = new Set();
-  if (curatedDirName) {
+  if (existingCurated) {
     try {
-      const curatedHandle = await curatedParent.getDirectoryHandle(curatedDirName);
-      for await (const entry of curatedHandle.values()) {
+      for await (const entry of existingCurated.values()) {
         if (entry.kind === "file") curatedNames.add(entry.name);
       }
     } catch (_) {
@@ -1144,6 +1270,7 @@ async function selectPhoto(i) {
   if (i < 0 || i >= State.queue.length) return;
   State.index = i;
   State.colorVariant = COLOR_VARIANTS[1];
+  State.noiseVariant = NOISE_VARIANTS[0];
   highlightActiveThumb();
   const item = State.queue[i];
   el("progress-label").textContent = `${i + 1} / ${State.queue.length}`;
@@ -1241,6 +1368,7 @@ async function loadPhoto(item, presetFile) {
   // сбрасываем здесь (а не только в selectPhoto), чтобы после saveCurrent() -> loadPhoto()
   // кнопка "сохранить" не оставалась включённой из-за уже применённого варианта
   State.colorVariant = COLOR_VARIANTS[1];
+  State.noiseVariant = NOISE_VARIANTS[0];
   await rebuildPreviewBitmap();
   if (myGen !== State.loadGeneration) return; // устарело — за это время открыли другое фото
   fitPreviewToWindowInstant(); // масштаб под новые размеры превью выставляем сразу, до отрисовки, и без анимации — иначе новое фото на долю секунды деформируется в пропорции старого
@@ -1302,6 +1430,7 @@ function refreshDisplayBitmap() {
   c.height = h;
   const cctx = c.getContext("2d");
   cctx.drawImage(State.previewBitmap, 0, 0);
+  denoiseCanvas(c, State.noiseVariant);
   if (State.colorVariant.key !== COLOR_VARIANTS[0].key) {
     const imgData = cctx.getImageData(0, 0, w, h);
     applyColorTreatment(imgData, {
@@ -1565,7 +1694,9 @@ async function renderPropertiesPanel(item, file, bitmap) {
     input.className = "properties-edit-input";
     input.disabled = !State.copyMode;
 
-    const parts = splitExifDate(exif && exif.dateTaken) || splitExifDate(fileDateToExifDate(file.lastModified));
+    // file.lastModified бывает undefined — loadPhoto() после сохранения передаёт сюда
+    // Blob (из injectExif), а не File, и у Blob такого поля просто нет
+    const parts = splitExifDate(exif && exif.dateTaken) || splitExifDate(fileDateToExifDate(file.lastModified || Date.now()));
     input.value = `${parts.y}-${parts.mo}-${parts.d}T${parts.h}:${parts.mi}:${parts.se}`;
     dd.appendChild(input);
     dd.appendChild(copyBtn);
@@ -1700,16 +1831,14 @@ function setMapButtonsEnabled(enabled) {
 
 // кнопка глобуса не привязана к текущему фото — она значит "все готовые альбомы, по одной
 // метке на каждый", поэтому включена ровно тогда, когда активен режим "Альбомы" (см.
-// toggleAlbumsView). Выключение обязано закрыть окно глобуса и забыть список альбомов —
-// иначе при повторном входе в режим окно осталось бы с меток прошлого списка
+// toggleAlbumsView). Выключение — это просто уход из режима Альбомы (например, в Проводник),
+// а не закрытие программы, поэтому уже открытое окно глобуса не трогаем: Григорий считает
+// неверным закрывать окна карты/глобуса при потере фокуса — закрывать их должен только сам
+// пользователь или выход из программы (см. pagehide). При следующем входе в режим Альбомы
+// State.albumsList/albumsGeo и картинка в окне глобуса всё равно обновятся заново
+// (collectAlbumsGeo/refreshAlbumsGlobe ниже), так что ничего не устаревает "навсегда"
 function setGlobeButtonEnabled(enabled) {
   el("globe-btn").disabled = !enabled;
-  if (!enabled) {
-    if (State.globeWindow && !State.globeWindow.closed) State.globeWindow.close();
-    onGlobeWindowClosed();
-    State.albumsList = [];
-    State.albumsGeo = [];
-  }
 }
 
 // единая точка обновления обеих карт — так они всегда показывают один и тот же набор
@@ -1788,10 +1917,34 @@ function toggleEmbeddedMap() {
 
 let mapWindowWatcher = null; // следит за окном карты, чтобы погасить кнопку, если его закрыли крестиком, а не повторным кликом
 
+// та же величина запаса, что и EXIT_ZOOM_MARGIN в globe.html (карта внутри нырка) — Григорий:
+// "алгоритм не должен учитывать способ входа", поэтому зум-выход из ОТДЕЛЬНОГО окна карты (когда
+// глобус ещё вовсе не был открыт — самый частый случай) обязан вести себя так же, как и выход
+// из карты, встроенной в глобус, вместо того чтобы не поддерживать переход на глобус вообще
+const MAP_EXIT_ZOOM_MARGIN = 4;
+
 function toggleLocationMapWindow() {
+  // Кнопка отражает "карта альбома сейчас показана" в любом виде — отдельным окном
+  // (State.mapWindow) или встроенной в глобус (State.globeAlbumMode). Повторный клик обязан
+  // закрыть именно то, что показано сейчас, а не открыть третий, несвязанный вид — и не важно,
+  // каким путём был запущен показ (Григорий: "алгоритм не должен учитывать способ входа").
+  if (State.globeAlbumMode && State.globeWindow && !State.globeWindow.closed) {
+    State.globeWindow.postMessage({ type: "exit-album-mode" }, "*");
+    return;
+  }
   if (State.mapWindow && !State.mapWindow.closed) {
     State.mapWindow.close();
     onMapWindowClosed();
+    return;
+  }
+  // если глобус уже открыт — карту альбома логичнее показать тем же путём, что и нырок
+  // (тот же embed внутри глобуса, см. enterAlbumMode в globe.html), а не плодить третье
+  // несвязанное окно: тогда "подняться на глобус" работает одинаково, независимо от того,
+  // жестом зума или этой кнопкой был запущен показ карты
+  if (State.globeWindow && !State.globeWindow.closed) {
+    const albumIndex = State.albumsList.findIndex((a) => a.handle === resolveAlbumListHandle(State.albumHandle));
+    State.globeWindow.postMessage({ type: "enter-album-mode", albumIndex }, "*");
+    State.globeWindow.focus();
     return;
   }
   // без query-параметров — окно само сообщит о готовности ("map-ready"), и мы пришлём
@@ -1808,17 +1961,16 @@ function onMapWindowClosed() {
   clearInterval(mapWindowWatcher);
   mapWindowWatcher = null;
   State.mapWindow = null;
+  State.mapBaselineZoom = null;
   el("properties-map-new-btn").classList.remove("active");
 }
 
 let globeWindowWatcher = null; // следит за окном глобуса, чтобы погасить кнопку, если его закрыли крестиком
 
-function toggleGlobeWindow() {
-  if (State.globeWindow && !State.globeWindow.closed) {
-    State.globeWindow.close();
-    onGlobeWindowClosed();
-    return;
-  }
+// общий код открытия окна глобуса — переиспользуется и кнопкой глобуса, и переходом с
+// отдельной карты зумом наружу (см. MAP_EXIT_ZOOM_MARGIN ниже) — оба случая должны вести
+// себя одинаково
+function openGlobeWindow() {
   State.globeWindow = window.open("globe.html", "albom_globe");
   el("globe-btn").classList.add("active");
   clearInterval(globeWindowWatcher);
@@ -1827,11 +1979,33 @@ function toggleGlobeWindow() {
   }, 500);
 }
 
+function toggleGlobeWindow() {
+  if (State.globeWindow && !State.globeWindow.closed) {
+    State.globeWindow.close();
+    onGlobeWindowClosed();
+    return;
+  }
+  // отдельное окно карты альбома показывает то же самое, что и нырок в глобус (см.
+  // toggleLocationMapWindow, симметричная правка выше) — не открываем второе, никак не
+  // связанное окно, а закрываем прежнее и сразу продолжаем показывать тот же альбом внутри
+  // глобуса, как только он будет готов (см. "globe-ready" ниже)
+  if (State.mapWindow && !State.mapWindow.closed) {
+    State.mapWindow.close();
+    onMapWindowClosed();
+    State.globeResumeAlbum = true;
+  }
+  openGlobeWindow();
+}
+
 function onGlobeWindowClosed() {
   clearInterval(globeWindowWatcher);
   globeWindowWatcher = null;
+  // если окно глобуса закрылось целиком прямо во время показа карты альбома внутри него —
+  // кнопка внешней карты не должна остаться навсегда "залипшей" активной
+  if (State.globeAlbumMode) el("properties-map-new-btn").classList.remove("active");
   State.globeWindow = null;
   State.globeAlbumMode = false;
+  State.globeResumeAlbum = false;
   el("globe-btn").classList.remove("active");
 }
 
@@ -1875,6 +2049,11 @@ async function collectAlbumsGeo(generation) {
 // одной на альбом, в отличие от refreshMaps(), который шлёт все фото ТЕКУЩЕГО альбома
 function refreshAlbumsGlobe() {
   if (!(State.globeWindow && !State.globeWindow.closed)) return;
+  // защитная страховка на случай, если что-то всё же вызовет эту функцию в промежутке между
+  // заменой State.albumsList и перезапуском State.albumsGeo под его новую длину (см. toggleAlbumsView,
+  // folder-sort-select) — молча ничего не шлём вместо того, чтобы разослать заведомо
+  // рассинхронизированные по индексам метки
+  if (State.albumsGeo.length !== State.albumsList.length) return;
   const albums = State.albumsList
     .map((a, i) => (State.albumsGeo[i]
       ? { index: i, name: a.name.endsWith(ALBUM_SUFFIX) ? a.name.slice(0, -ALBUM_SUFFIX.length) : a.name, lat: State.albumsGeo[i].lat, lon: State.albumsGeo[i].lon }
@@ -1882,7 +2061,7 @@ function refreshAlbumsGlobe() {
     .filter(Boolean);
   // index у элементов albums — это исходный индекс в State.albumsList (не смещается фильтром
   // .filter(Boolean) выше), поэтому глобус может сравнивать его с activeIndex напрямую
-  const activeIndex = State.albumsList.findIndex((a) => a.handle === State.albumHandle);
+  const activeIndex = State.albumsList.findIndex((a) => a.handle === resolveAlbumListHandle(State.albumHandle));
   State.globeWindow.postMessage({ albums, activeIndex }, "*");
 }
 
@@ -1958,9 +2137,11 @@ function refreshDirty() {
   // конкретного цветового пресета (контраст/ч-б/тепло)
   const colorIsNeutral = State.colorVariant.key === COLOR_VARIANTS[0].key
     || State.colorVariant.key === COLOR_VARIANTS[1].key;
+  const noiseIsNeutral = State.noiseVariant.key === NOISE_VARIANTS[0].key;
   const visuallyNeutral = Math.abs(State.rotationDeg) < 0.05
     && perspectiveIsAtDefault()
     && colorIsNeutral
+    && noiseIsNeutral
     && cropIsAtDefault()
     && State.netQuarterTurns === 0
     && !State.netFlipped;
@@ -2765,21 +2946,105 @@ function resolveAlbumFolder(handle) {
   return parent ? current : State.rootHandle;
 }
 
+// контейнер для кураторских альбомов: внешняя «Папка для альбомов» из настроек, если задана и
+// доступна, иначе — папка ALBOMS_ROOT_DIR в корне State.rootHandle, создаём сами при первом
+// обращении (Григорий, 2026-10-11: «если папка с альбомами не задана, то создаём в корне папку
+// Alboms»). Оригиналы и Deleted эта настройка не касается — см. ensureOriginalsHandle/ensureDeletedHandle
+async function ensureAlbumsRootHandle() {
+  if (State.albumsRootHandle) {
+    try {
+      let perm = await State.albumsRootHandle.queryPermission({ mode: "readwrite" });
+      if (perm !== "granted") perm = await State.albumsRootHandle.requestPermission({ mode: "readwrite" });
+      if (perm === "granted") return State.albumsRootHandle;
+    } catch (_) {
+      // хендл больше не валиден (папку удалили/переименовали, разрешение отозвано и т.п.)
+    }
+    // нет доступа — не блокируем сохранение, используем дефолтную папку в этот раз и предупреждаем
+    setStatus("status-bar", "Нет доступа к папке альбомов из настроек — используется папка «" + ALBOMS_ROOT_DIR + "» в корне.");
+  }
+  return State.rootHandle.getDirectoryHandle(ALBOMS_ROOT_DIR, { create: true });
+}
+
+// как ensureAlbumsRootHandle, но не создаёт дефолтную ALBOMS_ROOT_DIR, если её ещё нет на
+// диске — для операций только на чтение (сканирование альбома на "звёздочки", список
+// "Альбомы"), чтобы простое открытие папки на просмотр не создавало лишнюю пустую папку
+async function peekAlbumsRootHandle() {
+  if (State.albumsRootHandle) {
+    try {
+      const perm = await State.albumsRootHandle.queryPermission({ mode: "read" });
+      if (perm === "granted") return State.albumsRootHandle;
+    } catch (_) {
+      // хендл больше не валиден
+    }
+    return null;
+  }
+  return State.rootHandle.getDirectoryHandle(ALBOMS_ROOT_DIR).catch(() => null);
+}
+
+// файл-маркер внутри кураторской папки — см. ALBUM_MARKER_FILE
+async function readAlbumMarker(dirHandle) {
+  try {
+    const fileHandle = await dirHandle.getFileHandle(ALBUM_MARKER_FILE);
+    return JSON.parse(await (await fileHandle.getFile()).text());
+  } catch (_) {
+    return null;
+  }
+}
+
+async function writeAlbumMarker(dirHandle, tripName) {
+  try {
+    const fileHandle = await dirHandle.getFileHandle(ALBUM_MARKER_FILE, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(JSON.stringify({ tripName }, null, 2));
+    await writable.close();
+  } catch (_) {
+    // не критично — в худшем случае альбом найдётся только по имени папки, как до этого маркера
+  }
+}
+
+// ищет уже существующую кураторскую папку для трипа tripName внутри albomsRoot: сперва по
+// маркеру (переживает переименование самой кураторской папки — см. ALBUM_MARKER_FILE), и
+// только если маркер не найден ни у одной папки — по старому способу (точное совпадение имени
+// "<трип>-Albom", как было до этой папки-контейнера; такие старые папки потом дозаписывают
+// маркер сами, см. ensureCuratedHandle)
+async function findCuratedFolder(albomsRoot, tripName) {
+  let legacyMatch = null;
+  for await (const entry of albomsRoot.values()) {
+    if (entry.kind !== "directory") continue;
+    const marker = await readAlbumMarker(entry);
+    if (marker && marker.tripName === tripName) return entry;
+    if (!marker && !legacyMatch && entry.name === tripName + ALBUM_SUFFIX) legacyMatch = entry;
+  }
+  return legacyMatch;
+}
+
 async function ensureCuratedHandle() {
   if (!State.curatedHandle) {
+    const tripHandle = resolveAlbumFolder(State.albumHandle);
+    const albomsRoot = await ensureAlbumsRootHandle();
     // если такая папка уже найдена при сканировании (пусть и под старым именем после
-    // переименования альбома) — используем её, иначе создаём новую на уровне альбома
-    const parent = resolveAlbumFolder(State.albumHandle);
-    const folderName = State.curatedDirName || parent.name + ALBUM_SUFFIX;
-    const isNewFolder = !State.curatedDirName;
-    State.curatedHandle = await parent.getDirectoryHandle(folderName, { create: true });
+    // переименования — её узнали по маркеру) — используем её, иначе ищем заново и, если нет,
+    // создаём новую с именем по умолчанию
+    let existing = State.curatedDirName
+      ? await albomsRoot.getDirectoryHandle(State.curatedDirName).catch(() => null)
+      : null;
+    if (!existing) existing = await findCuratedFolder(albomsRoot, tripHandle.name);
+    const isNewFolder = !existing;
+    const folderName = existing ? existing.name : tripHandle.name + ALBUM_SUFFIX;
+    State.curatedHandle = existing || await albomsRoot.getDirectoryHandle(folderName, { create: true });
     State.curatedDirName = folderName;
-    // если "-Albom" создаётся впервые, у родительской папки трипа появляется первый дочерний
-    // узел — но стрелку раскрытия дерева слева посчитали один раз при построении узла и без
-    // явного обновления она так и останется пустой (см. createFolderNode/initialSubdirs)
     if (isNewFolder) {
-      const refresh = State.folderExpanders.get(parent);
+      await writeAlbumMarker(State.curatedHandle, tripHandle.name);
+      // если albomsRoot — это дефолтная "Alboms" внутри дерева слева (а не внешняя папка из
+      // настроек), у неё мог быть уже посчитан (пустой) список детей — без обновления стрелки
+      // раскрытия новая папка не появится в дереве без полной пересборки
+      const refresh = State.folderExpanders.get(albomsRoot);
       if (refresh) await refresh();
+    } else {
+      // старая папка, найденная по имени (перенесена вручную до этой фичи, маркера ещё нет) —
+      // дозаписываем маркер, чтобы следующий раз её нашли даже после переименования
+      const marker = await readAlbumMarker(State.curatedHandle);
+      if (!marker) await writeAlbumMarker(State.curatedHandle, tripHandle.name);
     }
   }
   return State.curatedHandle;
@@ -2922,6 +3187,10 @@ async function saveCurrent() {
     } else {
       fullRect = { x: 0, y: 0, w: sourceCanvas.width, h: sourceCanvas.height };
     }
+    // как и цветокоррекция внутри exportCrop, шумоподавление применяется к ПОЛНОМУ кадру
+    // (после поворота/перспективы, до обрезки) — иначе более тугой кроп менял бы то, что
+    // попадает в оценку шума, и результат зависел бы от рамки обрезки
+    denoiseCanvas(sourceCanvas, State.noiseVariant);
     const outCanvas = exportCrop(sourceCanvas, fullRect, colorOpts);
     const rawBlob = await new Promise((resolve) => outCanvas.toBlob(resolve, "image/jpeg", 0.92));
     // canvas.toBlob() стирает весь EXIF — возвращаем камеру/дату/GPS исходного фото
@@ -3324,15 +3593,15 @@ function onViewerKeydown(evt) {
   // Delete отправляет текущее фото в корзину сразу, без подтверждения — по просьбе Григория
   // это должно ускорять отбор кадров, а не тормозить его лишним диалогом
   if (evt.key === "Delete") {
-    if (State.colorPickerActive) return;
+    if (State.colorPickerActive || State.noisePickerActive) return;
     evt.preventDefault();
     deleteCurrentPhoto();
     return;
   }
 
-  // в подборе цвета лента показывает не фото альбома, а варианты текущего кадра — тем же
-  // порядком стрелок листаем их, а не State.queue
-  if (State.colorPickerActive) {
+  // в подборе цвета/шумоподавления лента показывает не фото альбома, а варианты текущего
+  // кадра — тем же порядком стрелок листаем их, а не State.queue
+  if (State.colorPickerActive || State.noisePickerActive) {
     const current = el("album-grid").querySelector(".variant-thumb.active") || el("album-grid").querySelector(".variant-thumb");
     const next = current && findGridNeighbor(current, evt.key);
     if (!next) return;
@@ -3503,6 +3772,7 @@ function getCroppedPreviewCanvas() {
 
 async function generateColorVariants() {
   const baseCanvas = getCroppedPreviewCanvas();
+  denoiseCanvas(baseCanvas, State.noiseVariant); // текущее шумоподавление уже применено — превью варианта честное
   const thumbW = 90;
   const thumbH = Math.max(1, Math.round((thumbW * baseCanvas.height) / baseCanvas.width));
 
@@ -3564,12 +3834,15 @@ async function showColorVariantPicker() {
   updateThumbSizing();
 }
 
-// собирает миниатюру текущего фото с уже применённым цветовым вариантом — не трогая диск,
-// только для показа в альбоме после возврата из подбора (см. loadPhoto: та же логика
-// "записать в память, затем показать", что и после сохранения/восстановления)
-function buildColoredCroppedCanvas() {
+// собирает миниатюру текущего фото с уже применёнными шумоподавлением и цветовым вариантом —
+// не трогая диск, только для показа в альбоме после возврата из любого из двух подборов (см.
+// loadPhoto: та же логика "записать в память, затем показать", что и после сохранения/
+// восстановления). Общая для обоих инструментов, чтобы миниатюра всегда отражала оба сразу,
+// независимо от того, какой из них закрыли последним.
+function buildTreatedCroppedCanvas() {
   const canvas = getCroppedPreviewCanvas();
-  if (State.colorVariant.key === COLOR_VARIANTS[0].key) return canvas; // "Оригинал" — обработка не нужна
+  denoiseCanvas(canvas, State.noiseVariant);
+  if (State.colorVariant.key === COLOR_VARIANTS[0].key) return canvas; // "Оригинал" — обработка цвета не нужна
   const ctx = canvas.getContext("2d");
   const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   applyColorTreatment(imgData, {
@@ -3590,7 +3863,7 @@ async function selectColorVariant(preset, btn) {
   // а не тянем highlightActiveThumb()/updateThumbImg(), которые перепутали бы содержимое кнопок
   el("album-grid").querySelectorAll(".variant-thumb").forEach((b) => b.classList.toggle("active", b === btn));
   const item = State.queue[State.index];
-  if (item) await regenerateThumbFromFile(item, buildColoredCroppedCanvas());
+  if (item) await regenerateThumbFromFile(item, buildTreatedCroppedCanvas());
 }
 
 function exitColorVariantPicker() {
@@ -3604,8 +3877,102 @@ function exitColorVariantPicker() {
 }
 
 function toggleColorPicker() {
+  if (State.colorPickerActive) { exitColorVariantPicker(); return; }
+  if (State.noisePickerActive) exitDenoisePicker(); // два подбора одновременно не открываем
+  showColorVariantPicker();
+}
+
+// зеркало generateColorVariants/showColorVariantPicker/selectColorVariant/exitColorVariantPicker/
+// toggleColorPicker выше — тот же паттерн "отдельный инструмент", просто для NOISE_VARIANTS
+async function generateNoiseVariants() {
+  const baseCanvas = getCroppedPreviewCanvas();
+  const thumbW = 90;
+  const thumbH = Math.max(1, Math.round((thumbW * baseCanvas.height) / baseCanvas.width));
+
+  const variants = [];
+  for (const preset of NOISE_VARIANTS) {
+    const c = document.createElement("canvas");
+    c.width = thumbW;
+    c.height = thumbH;
+    const cctx = c.getContext("2d");
+    cctx.drawImage(baseCanvas, 0, 0, thumbW, thumbH);
+    denoiseCanvas(c, preset);
+    // текущий цветовой вариант уже применён — превью силы шумоподавления честное относительно
+    // того, что пользователь увидит в итоге
+    if (State.colorVariant.key !== COLOR_VARIANTS[0].key) {
+      const imgData = cctx.getImageData(0, 0, thumbW, thumbH);
+      applyColorTreatment(imgData, {
+        saturationBoost: State.colorVariant.saturationBoost,
+        clipPercent: State.colorVariant.clipPercent,
+        warm: State.colorVariant.warm,
+      });
+      cctx.putImageData(imgData, 0, 0);
+    }
+    const blob = await new Promise((resolve) => c.toBlob(resolve, "image/jpeg", 0.8));
+    variants.push({ preset, url: URL.createObjectURL(blob) });
+  }
+  return variants;
+}
+
+async function showNoiseVariantPicker() {
+  State.noisePickerActive = true;
+  el("denoise-btn").classList.add("active");
+  freezeEditingControls(true);
+
+  const grid = el("album-grid");
+  grid.classList.add("denoise-picker-mode");
+  grid.innerHTML = "";
+  const variants = await generateNoiseVariants();
+  grid.innerHTML = "";
+  variants.forEach(({ preset, url }, i) => {
+    const btn = document.createElement("button");
+    btn.className = "thumb variant-thumb";
+    btn.dataset.index = i;
+    if (State.noiseVariant.key === preset.key) btn.classList.add("active");
+    btn.title = preset.label;
+
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = preset.label;
+    img.classList.add("loaded");
+    btn.appendChild(img);
+
+    const label = document.createElement("span");
+    label.className = "variant-label";
+    label.textContent = preset.label;
+    btn.appendChild(label);
+
+    btn.addEventListener("click", () => selectNoiseVariant(preset, btn));
+    btn.addEventListener("dblclick", () => exitDenoisePicker());
+    grid.appendChild(btn);
+  });
+  updateThumbSizing();
+}
+
+async function selectNoiseVariant(preset, btn) {
+  State.noiseVariant = preset;
+  refreshDirty();
+  refreshDisplayBitmap();
+  requestRender();
+  el("album-grid").querySelectorAll(".variant-thumb").forEach((b) => b.classList.toggle("active", b === btn));
+  const item = State.queue[State.index];
+  if (item) await regenerateThumbFromFile(item, buildTreatedCroppedCanvas());
+}
+
+function exitDenoisePicker() {
+  State.noisePickerActive = false;
+  el("denoise-btn").classList.remove("active");
+  el("album-grid").classList.remove("denoise-picker-mode");
+  freezeEditingControls(false);
+  buildGrid();
+  State.queue.forEach((_, i) => updateThumbImg(i));
+  highlightActiveThumb();
+}
+
+function toggleDenoisePicker() {
+  if (State.noisePickerActive) { exitDenoisePicker(); return; }
   if (State.colorPickerActive) exitColorVariantPicker();
-  else showColorVariantPicker();
+  showNoiseVariantPicker();
 }
 
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -3621,8 +3988,63 @@ async function openAboutModal() {
   // Проводнике" в новой сессии, хотя сохранённое значение никуда не пропадало
   await loadSavedRootAbsolutePath();
   input.value = State.rootAbsolutePath || "";
+  renderAlbumsRootSetting();
 }
 function closeAboutModal() { el("about-modal").hidden = true; }
+
+// отдельная «Папка для альбомов» из настроек — см. ensureAlbumsRootHandle. Хендл загружается
+// один раз при старте (см. init), здесь только выбор/сброс и отображение текущего значения
+async function loadAlbumsRootHandle() {
+  try {
+    State.albumsRootHandle = (await idbGet("albumsRootHandle")) || null;
+  } catch (_) {
+    State.albumsRootHandle = null;
+  }
+}
+
+function renderAlbumsRootSetting() {
+  const status = el("albums-root-status");
+  const forgetBtn = el("albums-root-forget-btn");
+  if (State.albumsRootHandle) {
+    status.textContent = State.albumsRootHandle.name;
+    forgetBtn.hidden = false;
+  } else {
+    status.textContent = "по умолчанию — «" + ALBOMS_ROOT_DIR + "» в корне «Папки альбомов»";
+    forgetBtn.hidden = true;
+  }
+}
+
+// если альбом уже открыт, при смене «Папки для альбомов» переоткрываем "звёздочки"/поиск
+// кураторской папки по новому месту — иначе до следующего openAlbum() State.curatedDirName
+// указывал бы на старое место
+async function refreshCuratedDiscoveryIfAlbumOpen() {
+  if (!State.albumHandle) return;
+  State.curatedHandle = null;
+  State.curatedDirName = null;
+  await scanFiles();
+  buildGrid();
+}
+
+async function pickAlbumsRootFolder() {
+  let handle;
+  try {
+    handle = await window.showDirectoryPicker({ id: "photo-editor-albums-root", mode: "readwrite" });
+  } catch (e) {
+    if (e.name !== "AbortError") setStatus("status-bar", "Не удалось выбрать папку альбомов: " + e.message);
+    return;
+  }
+  State.albumsRootHandle = handle;
+  try { await idbSet("albumsRootHandle", handle); } catch (_) {}
+  renderAlbumsRootSetting();
+  await refreshCuratedDiscoveryIfAlbumOpen();
+}
+
+async function forgetAlbumsRootFolder() {
+  State.albumsRootHandle = null;
+  try { await idbSet("albumsRootHandle", null); } catch (_) {}
+  renderAlbumsRootSetting();
+  await refreshCuratedDiscoveryIfAlbumOpen();
+}
 
 // режим просмотра готовых альбомов: дерево слева временно заменяется плоским списком
 // папок "…-Albom" (найденных findAlbumFolders на любой глубине). Строки — те же
@@ -3662,17 +4084,69 @@ async function toggleAlbumsView() {
   if (!State.albumsViewActive) {
     State.albumsViewActive = true;
     el("albums-list-btn").classList.add("active");
+    // режимы Альбомы/Проводник равнозначны — при следующем запуске приложение должно открыться
+    // в том же режиме, в котором его закрыли (см. tryRestoreLastAlbum), а не всегда в Альбомах
+    idbSet("lastViewMode", "albums").catch(() => {});
+    // путь берём ДО renderAlbumsView() — она полностью заменяет State.folderRows/folderParents
+    // результатом своего НЕЗАВИСИМОГО обхода findAlbumFolders, а хендлы File System Access API из
+    // разных обходов не совпадают по ссылке (===) даже для одной и той же папки на диске, поэтому
+    // State.albumHandle из предыдущего обхода после пересборки уже ничему в новой карте не равен
+    // (тот же приём, что и в ветке выхода из Альбомов ниже)
+    const activePath = State.albumHandle ? folderNamePath(State.albumHandle) : [];
     await renderAlbumsView();
     // глобус теперь всегда значит "все готовые альбомы, по одной метке на каждый" — включаем
-    // его вместе с режимом "Альбомы" и сразу запускаем фоновый поиск геоданных по списку
+    // его вместе с режимом "Альбомы" и сразу запускаем фоновый поиск геоданных по списку.
+    // Делаем это СРАЗУ после renderAlbumsView() и ДО поиска/открытия совпавшего альбома ниже —
+    // renderAlbumsView() уже заменила State.albumsList новым массивом, и State.albumsGeo обязана
+    // смениться вместе с ним в тот же момент: иначе openAlbum() из ветки match ниже (или любой ещё
+    // не остановившийся фоновый воркер прошлого collectAlbumsGeo — его generation инвалидируется
+    // только следующей строкой) успел бы вызвать refreshAlbumsGlobe(), которая читала бы geo-массив
+    // ПРОШЛОГО обхода по индексам НОВОГО albumsList — рассинхронизация индексов, из-за которой
+    // глобус на живой проверке "судорожно тряс" метки при возврате в Альбомы
     setGlobeButtonEnabled(true);
     State.albumsGeo = new Array(State.albumsList.length).fill(null);
     collectAlbumsGeo(++State.albumsGeoGeneration);
+    if (activePath.length > 0) {
+      // ищем альбом, чей путь — префикс activePath: так находится и сам альбом, и случай, когда
+      // фокус был на вложенной подпапке внутри альбома
+      const match = State.albumsList.find((a) => {
+        const entryPath = folderNamePath(a.handle);
+        return samePath(entryPath, activePath.slice(0, entryPath.length));
+      });
+      if (match) {
+        const entryPath = folderNamePath(match.handle);
+        if (entryPath.length === activePath.length) {
+          // фокус уже стоял ровно на этом альбоме (например, при автостарте — openAlbum для него
+          // уже был вызван непосредственно перед переключением режима) — просто подсвечиваем
+          // строку, не запуская повторное сканирование того же самого альбома
+          State.albumHandle = match.handle;
+        } else {
+          // фокус был на вложенной подпапке внутри альбома — в Проводнике показывались её
+          // собственные фото, а не фото всего альбома; открываем альбом по-настоящему
+          await openAlbum(match.handle);
+        }
+        const row = State.folderRows.get(match.handle);
+        if (row) highlightFolderRow(row, { center: true });
+      } else {
+        // фокус был на папке вне какого-либо альбома — фокус теряется, показанные фото сбрасываются
+        State.albumHandle = null;
+        showEmptyAlbum();
+      }
+    }
     return;
   }
   State.albumsViewActive = false;
   el("albums-list-btn").classList.remove("active");
+  idbSet("lastViewMode", "explorer").catch(() => {});
   setGlobeButtonEnabled(false);
+  await showFolderTreeView();
+}
+
+// показывает дерево папок видимо в DOM — то самое построение, что openAlbum() уже делает
+// один раз молча (buildFolderTree(..., {silent:true}), см. её комментарий) на случай, если
+// приложение решит остаться в Проводнике вообще без переключения режима (см.
+// restoreViewModeAfterAlbumOpen) — а не только при явном выходе из Альбомов выше
+async function showFolderTreeView() {
   // путь берём ДО перестройки дерева (buildFolderTree сбрасывает folderParents) — на этот
   // момент карта ещё та, что построил findAlbumFolders внутри renderAlbumsView, и в ней уже
   // есть цепочка предков и для альбома, открытого кликом по строке списка альбомов
@@ -3802,10 +4276,30 @@ function init() {
       // строке списка не выключает albumsViewActive (см. клик по name в createFolderNode), так
       // что список остаётся на экране и при открытом альбоме; старая проверка из-за этого молча
       // игнорировала смену сортировки в этом, самом частом, случае.
+      // путь берём ДО renderAlbumsView() — она полностью заменяет State.folderRows/folderParents
+      // результатом своего НЕЗАВИСИМОГО обхода findAlbumFolders, а хендлы File System Access API
+      // из разных обходов не совпадают по ссылке (===) даже для одной и той же папки на диске
+      // (тот же приём, что и в toggleAlbumsView) — без него подсветка после смены сортировки
+      // молча терялась
+      const activePath = State.albumHandle ? folderNamePath(State.albumHandle) : [];
       await renderAlbumsView();
-      if (State.albumHandle) {
-        const row = State.folderRows.get(State.albumHandle);
-        if (row) highlightFolderRow(row);
+      // тот же перезапуск geo-сканирования, что и при входе в режим Альбомы (см. toggleAlbumsView) —
+      // renderAlbumsView() выше заменила State.albumsList новым массивом (в новом порядке
+      // сортировки), а State.albumsGeo из прошлого обхода по нему больше не совпадает по индексам;
+      // без перезапуска глобус (если открыт) продолжил бы показывать метки по старым индексам,
+      // то есть на местах чужих альбомов
+      State.albumsGeo = new Array(State.albumsList.length).fill(null);
+      collectAlbumsGeo(++State.albumsGeoGeneration);
+      if (activePath.length > 0) {
+        const match = State.albumsList.find((a) => {
+          const entryPath = folderNamePath(a.handle);
+          return samePath(entryPath, activePath.slice(0, entryPath.length));
+        });
+        if (match) {
+          State.albumHandle = match.handle;
+          const row = State.folderRows.get(match.handle);
+          if (row) highlightFolderRow(row);
+        }
       }
       return;
     }
@@ -3833,6 +4327,8 @@ function init() {
   el("root-path-input").addEventListener("keydown", (evt) => {
     if (evt.key === "Enter") { evt.preventDefault(); el("root-path-input").blur(); }
   });
+  el("albums-root-pick-btn").addEventListener("click", pickAlbumsRootFolder);
+  el("albums-root-forget-btn").addEventListener("click", forgetAlbumsRootFolder);
 
   // "Установить на рабочий стол" — сама кнопка живёт всегда (см. правило про disabled вместо
   // hidden), но реально включается только когда браузер сам решил, что приложение
@@ -3885,6 +4381,15 @@ function init() {
     }
     if (data.type === "globe-ready") {
       refreshAlbumsGlobe();
+      // глобус только что открыт взамен закрытого окна карты (см. toggleGlobeWindow) — не
+      // терять контекст: сразу продолжаем показывать тот же альбом, что был в закрытом окне
+      if (State.globeResumeAlbum) {
+        State.globeResumeAlbum = false;
+        const albumIndex = State.albumsList.findIndex((a) => a.handle === resolveAlbumListHandle(State.albumHandle));
+        if (albumIndex !== -1) {
+          State.globeWindow.postMessage({ type: "enter-album-mode", albumIndex }, "*");
+        }
+      }
       return;
     }
     if (data.type === "globe-entered-album") {
@@ -3903,19 +4408,34 @@ function init() {
           const row = State.folderRows.get(entry.handle);
           if (row) highlightFolderRow(row);
           await openAlbum(entry.handle);
-          try {
-            await idbSet("lastFocusedPath", folderNamePath(entry.handle));
-          } catch (_) {
-            // необязательная удобная фича
-          }
+          // не await — необязательная удобная фича, не должна задерживать обновление
+          // globeAlbumMode/кнопок ниже (см. живую проверку сценария "внешняя карта → кнопка
+          // глобуса": эта запись в IndexedDB иногда занимает ощутимое время под Chromium'ом,
+          // если окно потеряло фокус из-за только что открытого/закрытого попапа, из-за чего
+          // кнопки на секунду-полторы оставались в устаревшем состоянии)
+          idbSet("lastFocusedPath", folderNamePath(entry.handle)).catch(() => {});
         }
       }
+      // карта альбома внутри "нырнувшего" глобуса дублирует то же самое отдельное окно
+      // карты — не показываем два внешних вида карты одновременно (правило Григория)
+      if (State.mapWindow && !State.mapWindow.closed) {
+        State.mapWindow.close();
+        onMapWindowClosed();
+      }
       State.globeAlbumMode = true;
+      // сейчас в окне глобуса видна карта альбома (та же map.html, что и у кнопки внешней
+      // карты) — активная кнопка обязана отражать то, что реально сейчас на экране, независимо
+      // от того, был ли вход жестом зума или самой этой кнопкой (см. onGlobeWindowClosed)
+      el("globe-btn").classList.remove("active");
+      el("properties-map-new-btn").classList.add("active");
       refreshMaps(); // сразу шлём точки текущего альбома — иначе первая карта пуста до смены фото
       return;
     }
     if (data.type === "globe-left-album") {
       State.globeAlbumMode = false;
+      // вернулись к обзору глобуса — кнопка снова активна, если окно всё ещё открыто
+      if (State.globeWindow && !State.globeWindow.closed) el("globe-btn").classList.add("active");
+      el("properties-map-new-btn").classList.remove("active");
       return;
     }
     if (data.type === "globe-preview-album") {
@@ -3958,12 +4478,33 @@ function init() {
     }
     if (e.source === State.mapWindow && typeof data.lat === "number" && typeof data.lon === "number") {
       setCurrentGeo(data.lat, data.lon);
+      return;
+    }
+    // отдельное (не встроенное в глобус) окно карты шлёт те же "map-baseline-zoom"/"map-zoom",
+    // что и карта внутри нырка (map.html не различает хоста) — раньше здесь их никто не слушал,
+    // поэтому зум-выход работал только если глобус уже был открыт заранее; теперь отдельное окно
+    // тоже умеет "подняться" на глобус тем же зум-жестом, симметрично встроенному варианту
+    if (e.source === State.mapWindow && data.type === "map-baseline-zoom") {
+      State.mapBaselineZoom = data.zoom;
+      return;
+    }
+    if (e.source === State.mapWindow && data.type === "map-zoom") {
+      if (State.mapBaselineZoom !== null && data.zoom <= State.mapBaselineZoom - MAP_EXIT_ZOOM_MARGIN) {
+        State.mapWindow.close();
+        onMapWindowClosed();
+        State.globeResumeAlbum = true;
+        openGlobeWindow();
+      }
+      return;
     }
   });
-  // окно глобуса — отдельная вкладка ОС, она не закрывается сама вместе с этой страницей;
-  // без этого при закрытии приложения глобус остаётся висеть и больше не получает сообщений
+  // окна глобуса и внешней карты — отдельные вкладки ОС, сами они не закрываются вместе с этой
+  // страницей; без этого при закрытии приложения они остаются висеть и больше не получают
+  // сообщений (первоначально этот фикс касался только глобуса — Григорий проверял именно его —
+  // но окно отдельной карты подвержено ровно той же проблеме)
   window.addEventListener("pagehide", () => {
     if (State.globeWindow && !State.globeWindow.closed) State.globeWindow.close();
+    if (State.mapWindow && !State.mapWindow.closed) State.mapWindow.close();
   });
 
   el("open-album-btn").addEventListener("click", pickAlbum);
@@ -4002,6 +4543,7 @@ function init() {
   el("grid-btn").addEventListener("click", toggleGrid);
   el("perspective-btn").addEventListener("click", togglePerspectiveMode);
   el("color-btn").addEventListener("click", toggleColorPicker);
+  el("denoise-btn").addEventListener("click", toggleDenoisePicker);
   el("restore-btn").addEventListener("click", restoreOriginal);
   el("star-btn").addEventListener("click", toggleStar);
   el("prev-btn").addEventListener("click", prevPhoto);
@@ -4089,7 +4631,7 @@ function init() {
     return;
   }
 
-  tryRestoreLastAlbum();
+  loadAlbumsRootHandle().then(tryRestoreLastAlbum);
 }
 
 init();
